@@ -1,0 +1,15 @@
+# Binaries
+jaydb
+s3db
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test data & temporary files
+s3db_data/
+jaydb_data/
+*.tmp
+*.log
+.DS_Store
