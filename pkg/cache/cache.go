@@ -4,13 +4,15 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/avivklas/jaydb/pkg/storage"
 )
 
-// Item represents a cached object.
+// Item represents a cached object along with fetch timestamp.
 type Item struct {
-	Object *storage.Object
+	Object    *storage.Object
+	FetchedAt time.Time
 }
 
 // singleflightCall holds state for an in-flight cold storage fetch.
@@ -27,6 +29,7 @@ type Manager struct {
 	items    map[string]*Item
 	sfCalls  map[string]*singleflightCall
 	keyLocks sync.Map // map[string]*sync.Mutex
+	ttl      time.Duration
 
 	// Metrics counters
 	hits   uint64
@@ -40,7 +43,15 @@ func NewManager(driver storage.Driver) *Manager {
 		driver:  driver,
 		items:   make(map[string]*Item),
 		sfCalls: make(map[string]*singleflightCall),
+		ttl:     5 * time.Second, // 5s default TTL for cache freshness and multi-node consistency
 	}
+}
+
+// SetTTL sets the cache expiration duration.
+func (m *Manager) SetTTL(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ttl = d
 }
 
 func (m *Manager) getKeyMutex(key string) *sync.Mutex {
@@ -50,12 +61,15 @@ func (m *Manager) getKeyMutex(key string) *sync.Mutex {
 
 // Get retrieves an object from cache or cold storage with singleflight coalescing.
 func (m *Manager) Get(ctx context.Context, key string) (*storage.Object, error) {
+	now := time.Now()
+
 	// 1. Check cache under read lock
 	m.mu.RLock()
 	item, found := m.items[key]
+	ttl := m.ttl
 	m.mu.RUnlock()
 
-	if found {
+	if found && ttl > 0 && now.Sub(item.FetchedAt) < ttl {
 		atomic.AddUint64(&m.hits, 1)
 		return item.Object, nil
 	}
@@ -65,7 +79,7 @@ func (m *Manager) Get(ctx context.Context, key string) (*storage.Object, error) 
 	// 2. Coalesce cold-storage reads via singleflight
 	m.mu.Lock()
 	// Double check cache after acquiring write lock
-	if item, found := m.items[key]; found {
+	if item, found := m.items[key]; found && m.ttl > 0 && now.Sub(item.FetchedAt) < m.ttl {
 		m.mu.Unlock()
 		atomic.AddUint64(&m.hits, 1)
 		return item.Object, nil
@@ -90,7 +104,12 @@ func (m *Manager) Get(ctx context.Context, key string) (*storage.Object, error) 
 	m.mu.Lock()
 	delete(m.sfCalls, key)
 	if call.err == nil && call.val != nil {
-		m.items[key] = &Item{Object: call.val}
+		m.items[key] = &Item{
+			Object:    call.val,
+			FetchedAt: time.Now(),
+		}
+	} else if call.err != nil {
+		delete(m.items, key)
 	}
 	m.mu.Unlock()
 
@@ -114,7 +133,10 @@ func (m *Manager) Put(ctx context.Context, key string, value []byte, expectedETa
 
 	// Update cache entry on success
 	m.mu.Lock()
-	m.items[key] = &Item{Object: obj}
+	m.items[key] = &Item{
+		Object:    obj,
+		FetchedAt: time.Now(),
+	}
 	m.mu.Unlock()
 
 	return obj, nil
