@@ -3,15 +3,20 @@ package s3
 import (
 	"bytes"
 	"context"
-	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"strconv"
+	"os"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 
 	"github.com/avivklas/jaydb/pkg/storage"
 )
@@ -23,70 +28,110 @@ type Config struct {
 	Region     string
 	AccessKey  string
 	SecretKey  string
+	Prefix     string
 	HTTPClient *http.Client
 }
 
-// Driver implements storage.Driver using S3 HTTP REST endpoints with conditional PUT/GET.
+// Driver implements storage.Driver using official AWS SDK v2 for S3 with SigV4 and IAM role support.
 type Driver struct {
-	cfg        Config
-	client     *http.Client
-	baseURL    string
-	mu         sync.RWMutex
+	cfg    Config
+	client *s3.Client
+	bucket string
+	prefix string
 }
 
-// NewDriver initializes a new S3 cold storage driver.
+// NewDriver initializes a new AWS SDK v2 S3 storage driver.
 func NewDriver(cfg Config) (storage.Driver, error) {
-	if cfg.Endpoint == "" {
-		cfg.Endpoint = "https://s3.amazonaws.com"
+	ctx := context.Background()
+	region := cfg.Region
+	if region == "" {
+		region = os.Getenv("JAYDB_S3_REGION")
 	}
-	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
+	if region == "" {
+		region = os.Getenv("AWS_REGION")
 	}
-	endpoint := strings.TrimSuffix(cfg.Endpoint, "/")
-	baseURL := fmt.Sprintf("%s/%s", endpoint, cfg.Bucket)
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	var opts []func(*config.LoadOptions) error
+	opts = append(opts, config.WithRegion(region))
+
+	if cfg.HTTPClient != nil {
+		opts = append(opts, config.WithHTTPClient(cfg.HTTPClient))
+	}
+
+	if cfg.AccessKey != "" && cfg.SecretKey != "" {
+		opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")))
+	} else if cfg.Endpoint != "" || cfg.HTTPClient != nil {
+		opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy-key", "dummy-secret", "")))
+	}
+
+	awsCfg, err := config.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		if cfg.Endpoint != "" {
+			o.BaseEndpoint = aws.String(cfg.Endpoint)
+			o.UsePathStyle = true
+		}
+	})
+
+	prefix := strings.Trim(cfg.Prefix, "/")
 
 	return &Driver{
-		cfg:     cfg,
-		client:  cfg.HTTPClient,
-		baseURL: baseURL,
+		cfg:    cfg,
+		client: s3Client,
+		bucket: cfg.Bucket,
+		prefix: prefix,
 	}, nil
 }
 
-func (d *Driver) objectURL(key string) string {
-	escapedKey := url.PathEscape(strings.TrimPrefix(key, "/"))
-	return fmt.Sprintf("%s/%s", d.baseURL, escapedKey)
+func (d *Driver) resolveKey(key string) string {
+	cleanKey := strings.TrimPrefix(key, "/")
+	if d.prefix == "" {
+		return cleanKey
+	}
+	return d.prefix + "/" + cleanKey
 }
 
 func (d *Driver) Get(ctx context.Context, key string) (*storage.Object, error) {
-	u := d.objectURL(key)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	s3Key := d.resolveKey(key)
+	out, err := d.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(d.bucket),
+		Key:    aws.String(s3Key),
+	})
 	if err != nil {
-		return nil, fmt.Errorf("s3 get request create error: %w", err)
+		var noKey *types.NoSuchKey
+		var notFound *types.NotFound
+		if errors.As(err, &noKey) || errors.As(err, &notFound) {
+			return nil, storage.ErrNotFound
+		}
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && (apiErr.ErrorCode() == "NoSuchKey" || apiErr.ErrorCode() == "NotFound" || apiErr.ErrorCode() == "404") {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("s3 get failed: %w", err)
 	}
+	defer out.Body.Close()
 
-	resp, err := d.client.Do(req)
+	data, err := io.ReadAll(out.Body)
 	if err != nil {
-		return nil, fmt.Errorf("s3 get request error: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, storage.ErrNotFound
-	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("s3 get failed (%d): %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("s3 read body failed: %w", err)
 	}
 
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("s3 read body error: %w", err)
+	etag := ""
+	if out.ETag != nil {
+		etag = strings.Trim(*out.ETag, `"`)
+		etag = fmt.Sprintf(`"%s"`, etag)
 	}
 
-	etag := strings.Trim(resp.Header.Get("ETag"), `"`)
-	etag = fmt.Sprintf(`"%s"`, etag)
-
-	modTime, _ := time.Parse(http.TimeFormat, resp.Header.Get("Last-Modified"))
+	modTime := time.Now()
+	if out.LastModified != nil {
+		modTime = *out.LastModified
+	}
 
 	return &storage.Object{
 		Key:     key,
@@ -97,156 +142,114 @@ func (d *Driver) Get(ctx context.Context, key string) (*storage.Object, error) {
 }
 
 func (d *Driver) Put(ctx context.Context, key string, value []byte, expectedETag string) (*storage.Object, error) {
-	u := d.objectURL(key)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, bytes.NewReader(value))
+	s3Key := d.resolveKey(key)
+	input := &s3.PutObjectInput{
+		Bucket: aws.String(d.bucket),
+		Key:    aws.String(s3Key),
+		Body:   bytes.NewReader(value),
+	}
+
+	if expectedETag == storage.MatchAnyETag {
+		input.IfNoneMatch = aws.String("*")
+	} else if expectedETag != "" {
+		cleanETag := strings.Trim(expectedETag, `"`)
+		input.IfMatch = aws.String(fmt.Sprintf(`"%s"`, cleanETag))
+	}
+
+	out, err := d.client.PutObject(ctx, input)
 	if err != nil {
-		return nil, fmt.Errorf("s3 put request create error: %w", err)
-	}
-
-	if expectedETag != "" {
-		if expectedETag == storage.MatchAnyETag {
-			req.Header.Set("If-None-Match", "*")
-		} else {
-			req.Header.Set("If-Match", expectedETag)
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && (apiErr.ErrorCode() == "PreconditionFailed" || apiErr.ErrorCode() == "412" || apiErr.ErrorCode() == "AccessDenied") {
+			if expectedETag == storage.MatchAnyETag {
+				return nil, storage.ErrAlreadyExists
+			}
+			return nil, storage.ErrVersionMismatch
 		}
+		return nil, fmt.Errorf("s3 put failed: %w", err)
 	}
 
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("s3 put request error: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusPreconditionFailed {
-		if expectedETag == storage.MatchAnyETag {
-			return nil, storage.ErrAlreadyExists
-		}
-		return nil, storage.ErrVersionMismatch
-	}
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("s3 put failed (%d): %s", resp.StatusCode, string(body))
-	}
-
-	newETag := strings.Trim(resp.Header.Get("ETag"), `"`)
-	if newETag != "" {
-		newETag = fmt.Sprintf(`"%s"`, newETag)
-	} else {
-		newETag = fmt.Sprintf(`"%x"`, time.Now().UnixNano())
+	etag := ""
+	if out.ETag != nil {
+		etag = strings.Trim(*out.ETag, `"`)
+		etag = fmt.Sprintf(`"%s"`, etag)
 	}
 
 	return &storage.Object{
 		Key:     key,
-		Value:   append([]byte(nil), value...),
-		ETag:    newETag,
+		Value:   value,
+		ETag:    etag,
 		ModTime: time.Now(),
 	}, nil
 }
 
 func (d *Driver) Delete(ctx context.Context, key string, expectedETag string) error {
-	u := d.objectURL(key)
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	s3Key := d.resolveKey(key)
+	_, err := d.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(d.bucket),
+		Key:    aws.String(s3Key),
+	})
 	if err != nil {
-		return fmt.Errorf("s3 delete request create error: %w", err)
+		return fmt.Errorf("s3 delete failed: %w", err)
 	}
-
-	if expectedETag != "" && expectedETag != storage.MatchAnyETag {
-		req.Header.Set("If-Match", expectedETag)
-	}
-
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("s3 delete request error: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusPreconditionFailed {
-		return storage.ErrVersionMismatch
-	}
-	if resp.StatusCode == http.StatusNotFound {
-		return storage.ErrNotFound
-	}
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("s3 delete failed (%d): %s", resp.StatusCode, string(body))
-	}
-
 	return nil
 }
 
-type listBucketResult struct {
-	XMLName        xml.Name `xml:"ListBucketResult"`
-	NextContinuationToken string `xml:"NextContinuationToken"`
-	IsTruncated    bool     `xml:"IsTruncated"`
-	Contents       []struct {
-		Key          string    `xml:"Key"`
-		Size         int64     `xml:"Size"`
-		ETag         string    `xml:"ETag"`
-		LastModified time.Time `xml:"LastModified"`
-	} `xml:"Contents"`
-}
-
 func (d *Driver) List(ctx context.Context, prefix string, opts storage.ListOptions) ([]*storage.KeyMeta, string, error) {
-	u, err := url.Parse(d.baseURL)
-	if err != nil {
-		return nil, "", fmt.Errorf("s3 list invalid url: %w", err)
-	}
-
-	q := u.Query()
-	q.Set("list-type", "2")
-	if prefix != "" {
-		q.Set("prefix", prefix)
+	s3Prefix := d.resolveKey(prefix)
+	input := &s3.ListObjectsV2Input{
+		Bucket: aws.String(d.bucket),
+		Prefix: aws.String(s3Prefix),
 	}
 	if opts.Limit > 0 {
-		q.Set("max-keys", strconv.Itoa(opts.Limit))
+		input.MaxKeys = aws.Int32(int32(opts.Limit))
 	}
 	if opts.Cursor != "" {
-		q.Set("continuation-token", opts.Cursor)
+		input.ContinuationToken = aws.String(opts.Cursor)
 	}
-	if opts.Delimiter != "" {
-		q.Set("delimiter", opts.Delimiter)
-	}
-	u.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	out, err := d.client.ListObjectsV2(ctx, input)
 	if err != nil {
-		return nil, "", fmt.Errorf("s3 list request create error: %w", err)
+		return nil, "", fmt.Errorf("s3 list failed: %w", err)
 	}
 
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("s3 list request error: %w", err)
-	}
-	defer resp.Body.Close()
+	var results []*storage.KeyMeta
+	for _, obj := range out.Contents {
+		if obj.Key == nil {
+			continue
+		}
+		k := *obj.Key
+		if d.prefix != "" {
+			k = strings.TrimPrefix(k, d.prefix+"/")
+		}
+		etag := ""
+		if obj.ETag != nil {
+			etag = strings.Trim(*obj.ETag, `"`)
+			etag = fmt.Sprintf(`"%s"`, etag)
+		}
+		modTime := time.Now()
+		if obj.LastModified != nil {
+			modTime = *obj.LastModified
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, "", fmt.Errorf("s3 list failed (%d): %s", resp.StatusCode, string(body))
-	}
+		var size int64
+		if obj.Size != nil {
+			size = *obj.Size
+		}
 
-	var res listBucketResult
-	if err := xml.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return nil, "", fmt.Errorf("s3 decode list xml error: %w", err)
-	}
-
-	var metas []*storage.KeyMeta
-	for _, c := range res.Contents {
-		etag := fmt.Sprintf(`"%s"`, strings.Trim(c.ETag, `"`))
-		metas = append(metas, &storage.KeyMeta{
-			Key:     c.Key,
-			Size:    c.Size,
+		results = append(results, &storage.KeyMeta{
+			Key:     k,
+			Size:    size,
 			ETag:    etag,
-			ModTime: c.LastModified,
+			ModTime: modTime,
 		})
 	}
 
 	nextCursor := ""
-	if res.IsTruncated {
-		nextCursor = res.NextContinuationToken
+	if out.NextContinuationToken != nil {
+		nextCursor = *out.NextContinuationToken
 	}
 
-	return metas, nextCursor, nil
+	return results, nextCursor, nil
 }
 
 func (d *Driver) Close() error {
