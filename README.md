@@ -20,6 +20,7 @@ When AI agents create new applications, traditional databases (Postgres, MongoDB
 | **Ops & Maintenance** | Requires server management, scaling, tuning | **Zero Maintenance** (100% serverless on S3) |
 | **Dev Environment** | Requires Docker, local services, credentials | **Zero Dependency** (`memory` or `fs` driver built-in) |
 | **Schema & Migrations** | Strict schemas, DDL scripts, migration risks | **Schema-Free Document Trees** (`JSON`, `MsgPack`, `Raw`) |
+| **Cluster & Consistency** | Complex replication & proxy setups | **Memberlist Gossip + Lexicographical QUIC Inter-Query Mesh** |
 | **Concurrency** | Complex row locks, connection pools | **Built-in Optimistic Locking (CAS / ETags)** + Singleflight |
 | **Agent API** | SQL ORMs or heavy client SDKs | **Simple Key-Document API** (REST HTTP or Go package) |
 
@@ -36,13 +37,14 @@ When AI agents create new applications, traditional databases (Postgres, MongoDB
 
 ### 2. 💸 Ultra Low-Cost (Cheap)
 - **Runs Production for < $0.32 / Month**: Uses AWS S3 (or any S3-compatible storage like MinIO, Cloudflare R2, Wasabi) as primary cold storage.
-- **Singleflight Read Coalescing**: On cache misses, key-level singleflight coalescing guarantees that only **1 read request reaches S3** among concurrent readers. The remaining callers wait and share the result, cutting S3 API costs by 95%+.
-- **Write-Through In-Memory Caching**: Absorbs read bursts and updates cache entries instantly.
+- **Singleflight Read Coalescing**: On cache misses, key-level singleflight coalescing guarantees that only **1 read request reaches S3** among concurrent readers on the responsible node.
+- **Strict Owner-Node In-Memory Caching**: Eliminates cache duplication across nodes by routing requests directly to the authoritative key owner node.
 
-### 3. 🛡️ Zero Ops Overhead (Low Maintenance)
-- **100% Serverless Backend**: S3 handles durability, availability, backups, and infinite scaling automatically.
-- **No Schema Migrations**: Save and update structured JSON documents directly without writing ALTER TABLE or DDL scripts.
-- **Atomic Optimistic Concurrency (CAS)**: Uses S3 `If-Match` / `If-None-Match` ETag headers for lock-free, race-condition-safe updates—ideal when multiple agent workers or async tasks write concurrently.
+### 3. 🛡️ Zero Ops & Flawless Multi-Node Consistency
+- **Memberlist Cluster Discovery**: Dynamically discovers nodes and maintains cluster health using the SWIM gossip protocol (`github.com/hashicorp/memberlist`).
+- **Lexicographical Consistent Partition Ring**: Maps document path prefixes deterministically to owning cluster nodes.
+- **QUIC Connection Mesh**: Maintains long-lived, multiplexed QUIC streams (`github.com/quic-go/quic-go`) between cluster nodes for sub-millisecond inter-query execution (`Get`, `Put`, `Delete`).
+- **Atomic Optimistic Concurrency (CAS)**: Uses S3 `If-Match` / `If-None-Match` ETag headers for lock-free, race-condition-safe updates across nodes.
 
 ---
 
@@ -66,10 +68,6 @@ JayDB is engineered to handle **1,000,000 API requests/month** for **under 32 ce
 | **Data Transfer Out** | First 100 GB / month free | FREE (up to 100 GB) | **$0.000** |
 | **TOTAL ESTIMATED COST** | | | **~$0.316 / month** |
 
-> [!TIP]
-> **Why is JayDB so cheap?**
-> Without JayDB's **in-memory sharded cache** and **singleflight request coalescing**, 1,000,000 S3 GET requests would cost **$0.40/mo**, and un-coalesced concurrent spikes could multiply S3 API charges. JayDB absorbs 95%+ of read traffic in memory and coalesces spikes so **only 1 S3 request goes out**, keeping your bill under **$0.32/month**.
-
 ---
 
 ## 🏗️ Architecture Overview
@@ -78,7 +76,9 @@ JayDB is engineered to handle **1,000,000 API requests/month** for **under 32 ce
 +-------------------------------------------------------------------------+
 |                              SERVER MODE                                |
 |  - fasthttp RESTful HTTP API (GET/PUT/DELETE/LIST)                      |
-|  - Inter-Node Router (Proxying non-local shard keys over fasthttp)      |
+|  - Memberlist Gossip Discovery (SWIM Protocol)                          |
+|  - Lexicographical Partition Ring (Prefix-based key distribution)       |
+|  - Multiplexed QUIC Connection Mesh (Inter-Query Execution)             |
 +-------------------------------------------------------------------------+
                                     |
                                     v (Wraps internally)
@@ -90,8 +90,8 @@ JayDB is engineered to handle **1,000,000 API requests/month** for **under 32 ce
 |  | High-Level Go API (Get, Put, Delete, List)                          |  |
 |  +---------------------------------------------------------------------+  |
 |  | Key-Level Mutex & Singleflight Cache Manager                        |  |
+|  |   - Flawless Multi-Node Consistency via Owner Node Routing          |  |
 |  |   - Read Coalescing (1 S3 GET for concurrent readers)               |  |
-|  |   - Write Population & CAS Invalidation                             |  |
 |  +---------------------------------------------------------------------+  |
 |  | Pluggable Codec (JSON default, Raw)                                 |  |
 |  +---------------------------------------------------------------------+  |
@@ -127,7 +127,7 @@ type UserProfile struct {
 func main() {
 	ctx := context.Background()
 
-	// Initialize S3 storage driver (or use memory.NewDriver() / fs.NewDriver("./data"))
+	// Initialize S3 storage driver
 	store, err := s3.NewDriver(s3.Config{
 		Bucket: "my-app-bucket",
 	})
@@ -171,60 +171,38 @@ func main() {
 }
 ```
 
-### 2. Standalone FastHTTP Server Mode
+### 2. Multi-Node Cluster Setup
 
-Run JayDB as a lightweight REST server binary for multi-language projects (Node.js, Python, Rust, etc.):
+Run JayDB nodes with `memberlist` gossip discovery and QUIC mesh inter-query routing:
 
-```bash
-# Build CLI binary
-go build -o jaydb ./cmd/jaydb
+```go
+// Node 1
+node1, _ := cluster.NewNode(cluster.NodeConfig{
+    NodeName: "node-1",
+    BindAddr: "127.0.0.1",
+    BindPort: 19001,
+    QuicPort: 19002,
+    Ring:     ring,
+    DBHandler: dbInstance1,
+})
 
-# Dev Mode: In-Memory (Zero dependencies, instant cleanup)
-./jaydb -addr :8080 -storage memory -sharding-depth 2
-
-# Dev/Single-Node Mode: Filesystem (Local persistence)
-./jaydb -addr :8080 -storage fs -fs-dir ./data
-
-# Production Mode: Cloud S3 (Infinite scaling, zero ops)
-./jaydb -addr :8080 -storage s3 -s3-bucket my-bucket
+// Node 2 (Joins Node 1)
+node2, _ := cluster.NewNode(cluster.NodeConfig{
+    NodeName:  "node-2",
+    BindAddr:  "127.0.0.1",
+    BindPort:  19003,
+    QuicPort:  19004,
+    JoinAddrs: []string{"127.0.0.1:19001"},
+    Ring:      ring,
+    DBHandler: dbInstance2,
+})
 ```
-
-#### REST HTTP API Cheat-Sheet for AI Agents:
-
-- **Create Document** (Fails if key already exists):
-  ```bash
-  curl -i -X PUT http://localhost:8080/v1/kv/users/123/profile \
-       -H "If-None-Match: *" \
-       -d '{"name":"Alice","email":"alice@example.com"}'
-  ```
-
-- **Get Document**:
-  ```bash
-  curl -i http://localhost:8080/v1/kv/users/123/profile
-  ```
-
-- **Update Document with CAS** (Safe concurrent updates):
-  ```bash
-  curl -i -X PUT http://localhost:8080/v1/kv/users/123/profile \
-       -H 'If-Match: "etag-value"' \
-       -d '{"name":"Alice","email":"new@example.com"}'
-  ```
-
-- **List Subtree**:
-  ```bash
-  curl -i http://localhost:8080/v1/list/users/123
-  ```
-
-- **Delete Document**:
-  ```bash
-  curl -i -X DELETE http://localhost:8080/v1/kv/users/123/profile
-  ```
 
 ---
 
 ## 🧪 Testing
 
-Run all unit and integration tests across storage drivers, singleflight cache manager, sharding ring, and FastHTTP server:
+Run all unit and integration tests across storage drivers, QUIC connection mesh, Memberlist discovery, singleflight cache manager, and FastHTTP server:
 
 ```bash
 go test -v ./...
@@ -235,4 +213,3 @@ go test -v ./...
 ## 📄 License
 
 [MIT](LICENSE)
-
