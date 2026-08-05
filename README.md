@@ -103,6 +103,13 @@ JayDB is engineered to handle **1,000,000 API requests/month** for **under 32 ce
 
 ## 🚀 Quickstart Guide for Agents & Developers
 
+JayDB supports **two deployment modes**:
+
+1. **Embedded Mode** (Go library): Import JayDB directly into your application. Zero network latency, full programmatic control.
+2. **Server Mode** (FastHTTP): Standalone microservice with RESTful HTTP API. Language-agnostic access.
+
+**All features work in both modes** except the HTTP server itself. Metrics, caching, clustering, CAS operations, and all storage drivers are available regardless of deployment mode.
+
 ### 1. Embedded Go Usage
 
 Import JayDB directly into your Go application:
@@ -171,7 +178,93 @@ func main() {
 }
 ```
 
-### 2. Multi-Node Cluster Setup
+**Metrics in Embedded Mode:**
+
+```go
+import (
+	"net/http"
+	"github.com/avivklas/jaydb/pkg/db"
+	"github.com/avivklas/jaydb/pkg/metrics"
+)
+
+// Initialize database and metrics collector
+database, _ := db.Open(db.Options{...})
+collector := metrics.NewCollector(
+	database.Cache().Stats,
+	database.Cache().GetCacheSize,
+)
+collector.Start()
+
+// Expose metrics on your own HTTP server (optional)
+http.Handle("/metrics", metrics.Handler())
+http.ListenAndServe(":9090", nil)
+
+// Or programmatically access cache stats
+hits, misses, sfHits := database.Cache().Stats()
+items, bytes := database.Cache().GetCacheSize()
+```
+
+**Run the embedded example:**
+```bash
+cd examples/embedded
+go run main.go
+# Metrics available at http://localhost:9090/metrics
+```
+```
+### 2. Server Mode (HTTP API)
+
+Run JayDB as a standalone HTTP server with RESTful API:
+
+```go
+package main
+
+import (
+	"log"
+	"github.com/avivklas/jaydb/pkg/db"
+	"github.com/avivklas/jaydb/pkg/server"
+	"github.com/avivklas/jaydb/pkg/storage/s3"
+)
+
+func main() {
+	// Open database
+	store, _ := s3.NewDriver(s3.Config{Bucket: "my-bucket"})
+	database, _ := db.Open(db.Options{Storage: store})
+	
+	// Wrap with HTTP server
+	srv, _ := server.NewServer(server.Options{DB: database})
+	
+	// Serve on :8080 (includes /metrics endpoint)
+	log.Fatal(srv.ListenAndServe(":8080"))
+}
+```
+
+**HTTP API Endpoints:**
+
+- `GET /v1/kv/{key}` - Retrieve document
+- `PUT /v1/kv/{key}` - Create/update document
+- `DELETE /v1/kv/{key}` - Delete document
+- `GET /v1/kv/{prefix}?list=true&limit=N` - List keys by prefix
+- `GET /metrics` - Prometheus metrics
+- `GET /v1/health` - Health check
+
+**CAS via HTTP Headers:**
+```bash
+# Get with ETag
+curl -i http://localhost:8080/v1/kv/users/123
+# ETag: "abc123"
+
+# Update with If-Match (CAS)
+curl -X PUT http://localhost:8080/v1/kv/users/123 \
+  -H "If-Match: abc123" \
+  -d '{"name":"Alice","age":31}'
+
+# Create-only with If-None-Match
+curl -X PUT http://localhost:8080/v1/kv/users/456 \
+  -H "If-None-Match: *" \
+  -d '{"name":"Bob"}'
+```
+
+### 3. Multi-Node Cluster Setup
 
 Run JayDB nodes with `memberlist` gossip discovery and QUIC mesh inter-query routing:
 
@@ -197,6 +290,69 @@ node2, _ := cluster.NewNode(cluster.NodeConfig{
     DBHandler: dbInstance2,
 })
 ```
+
+**Ephemeral ports:** set `BindPort` and/or `QuicPort` to `0` to let the OS assign a free port — useful in tests, containers, and any environment where a fixed port may already be taken. Because the value is only known once bound, read it back from the node:
+
+```go
+node, _ := cluster.NewNode(cluster.NodeConfig{
+    NodeName: "node-1",
+    BindAddr: "127.0.0.1",
+    BindPort: 0, // OS-assigned gossip port
+    QuicPort: 0, // OS-assigned QUIC mesh port
+    Ring:     ring,
+    DBHandler: dbInstance,
+})
+
+node.BindPort()     // actual gossip port, e.g. 54312
+node.QuicPort()     // actual QUIC port, e.g. 54313
+node.GossipAddr()   // "127.0.0.1:54312" — give this to peers as JoinAddrs
+node.SelfQuicAddr() // "127.0.0.1:54313" — what the ring registers
+
+// Peers join using the resolved address
+peer, _ := cluster.NewNode(cluster.NodeConfig{
+    NodeName:  "node-2",
+    BindAddr:  "127.0.0.1",
+    BindPort:  0,
+    QuicPort:  0,
+    JoinAddrs: []string{node.GossipAddr()},
+    Ring:      ring,
+    DBHandler: dbInstance2,
+})
+```
+
+Prefer fixed ports for long-lived seed nodes that peers must find by a known address; prefer `0` everywhere else.
+
+**Shutdown:** `Node.Close()` is idempotent and safe to call concurrently. Note that `db.Close()` also closes the `ClusterNode` it was configured with, so closing both is harmless and no particular order is required.
+
+---
+
+## 📊 Observability & Monitoring
+
+JayDB includes **comprehensive Prometheus metrics** for production monitoring:
+
+- **Cache Performance**: hit/miss rates, singleflight coalescing, size tracking
+- **Storage Backend**: operation latencies, throughput, bytes transferred
+- **HTTP Server**: request rates, latencies, response sizes
+- **CAS Conflicts**: optimistic locking contention tracking
+- **Cluster Health**: node count, forwarded requests, QUIC connections
+
+**Access metrics:**
+```bash
+# Automatic /metrics endpoint on HTTP server
+curl http://localhost:8080/metrics
+
+# Run metrics demo
+go run examples/metrics/main.go
+```
+
+**Key metrics:**
+- `jaydb_cache_hits_total` / `jaydb_cache_misses_total` — Cache effectiveness
+- `jaydb_storage_operation_duration_seconds` — Backend latency (histogram)
+- `jaydb_http_requests_total` — Request throughput by endpoint
+- `jaydb_cas_conflicts_total` — Optimistic locking conflicts
+- `jaydb_cluster_nodes` — Active cluster nodes
+
+See [`OBSERVABILITY.md`](OBSERVABILITY.md) for full documentation, PromQL examples, Grafana dashboards, and alerting rules.
 
 ---
 

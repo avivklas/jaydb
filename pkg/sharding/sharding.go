@@ -123,3 +123,11 @@ func (r *Ring) PartitionDepth() int {
 	defer r.mu.RUnlock()
 	return r.partitionDepth
 }
+
+// HasNode checks if a node address is registered in the ring.
+// Used for validating proxy forwarding targets.
+func (r *Ring) HasNode(nodeAddr string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.nodes[nodeAddr]
+}

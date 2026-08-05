@@ -78,8 +78,9 @@ func (m *Manager) Get(ctx context.Context, key string) (*storage.Object, error) 
 
 	// 2. Coalesce cold-storage reads via singleflight
 	m.mu.Lock()
-	// Double check cache after acquiring write lock
-	if item, found := m.items[key]; found && m.ttl > 0 && now.Sub(item.FetchedAt) < m.ttl {
+	// Double check cache after acquiring write lock (recapture time for fresh check)
+	now = time.Now()
+	if item, found := m.items[key]; found && ttl > 0 && now.Sub(item.FetchedAt) < ttl {
 		m.mu.Unlock()
 		atomic.AddUint64(&m.hits, 1)
 		return item.Object, nil
@@ -99,6 +100,8 @@ func (m *Manager) Get(ctx context.Context, key string) (*storage.Object, error) 
 	m.mu.Unlock()
 
 	// Execute single cold-storage fetch
+	// Use defer to ensure wg.Done() is called even if driver.Get panics
+	defer call.wg.Done()
 	call.val, call.err = m.driver.Get(ctx, key)
 
 	m.mu.Lock()
@@ -113,7 +116,6 @@ func (m *Manager) Get(ctx context.Context, key string) (*storage.Object, error) 
 	}
 	m.mu.Unlock()
 
-	call.wg.Done()
 	return call.val, call.err
 }
 
@@ -163,4 +165,19 @@ func (m *Manager) Invalidate(key string) {
 // Stats returns cache hits, misses, and singleflight coalesced hit metrics.
 func (m *Manager) Stats() (hits, misses, sfHits uint64) {
 	return atomic.LoadUint64(&m.hits), atomic.LoadUint64(&m.misses), atomic.LoadUint64(&m.sfHits)
+}
+
+// GetCacheSize returns the number of items and approximate bytes in cache.
+func (m *Manager) GetCacheSize() (items int, bytes int64) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	items = len(m.items)
+	var totalBytes int64
+	for _, item := range m.items {
+		if item.Object != nil {
+			totalBytes += int64(len(item.Object.Value))
+		}
+	}
+	return items, totalBytes
 }

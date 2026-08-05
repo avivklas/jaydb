@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -51,6 +52,12 @@ type Handler interface {
 }
 
 // NodeConfig specifies memberlist and QUIC mesh parameters.
+//
+// BindPort and QuicPort may each be 0 to request an OS-assigned ephemeral port.
+// The kernel then guarantees a free port, which removes the "bind: address
+// already in use" class of failure entirely. Because the caller cannot know the
+// assigned value up front, read it back after NewNode via Node.BindPort,
+// Node.QuicPort, or Node.SelfQuicAddr — those report what was actually bound.
 type NodeConfig struct {
 	NodeName  string
 	BindAddr  string
@@ -71,6 +78,15 @@ type Node struct {
 	conns     map[string]*quic.Conn
 	ctx       context.Context
 	cancel    context.CancelFunc
+	wg        sync.WaitGroup // Tracks background goroutines for graceful shutdown
+	closeOnce sync.Once      // Guarantees Close runs exactly once (memberlist.Leave panics after Shutdown)
+
+	// Ports actually bound, resolved from the listeners after they start. These
+	// differ from cfg.BindPort/cfg.QuicPort whenever a port of 0 was requested,
+	// so every address JayDB advertises (node meta, ring registration,
+	// SelfQuicAddr) must be built from these and never from cfg.
+	bindPort int
+	quicPort int
 }
 
 type eventDelegate struct {
@@ -130,6 +146,16 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	}
 	n.quicLn = quicLn
 
+	// Resolve the port the kernel actually assigned. With cfg.QuicPort == 0 this
+	// is the ephemeral port; otherwise it echoes the requested one.
+	n.quicPort, err = portFromAddr(quicLn.Addr())
+	if err != nil {
+		_ = quicLn.Close()
+		cancel()
+		return nil, fmt.Errorf("quic listen: resolve bound port: %w", err)
+	}
+
+	n.wg.Add(1) // Track acceptLoop goroutine
 	go n.acceptLoop()
 
 	// 2. Setup Memberlist
@@ -139,8 +165,10 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	mlConfig.BindPort = cfg.BindPort
 	mlConfig.Events = &eventDelegate{node: n}
 
+	// Advertise the resolved QUIC port so peers can reach this node's mesh
+	// listener. Using cfg.QuicPort here would publish 0 for ephemeral binds.
 	meta := make([]byte, 2)
-	binary.BigEndian.PutUint16(meta, uint16(cfg.QuicPort))
+	binary.BigEndian.PutUint16(meta, uint16(n.quicPort))
 	mlConfig.Delegate = &nodeDelegate{meta: meta}
 
 	mlist, err := memberlist.Create(mlConfig)
@@ -150,11 +178,11 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		return nil, fmt.Errorf("memberlist create error: %w", err)
 	}
 	n.mlist = mlist
+	n.bindPort = int(mlist.LocalNode().Port)
 
 	// Register self in ring
 	if n.ring != nil {
-		selfQuic := fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.QuicPort)
-		n.ring.AddNode(selfQuic)
+		n.ring.AddNode(n.SelfQuicAddr())
 	}
 
 	if len(cfg.JoinAddrs) > 0 {
@@ -162,6 +190,27 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	}
 
 	return n, nil
+}
+
+// portFromAddr extracts the port from a listener address, tolerating any
+// net.Addr implementation rather than assuming *net.UDPAddr.
+func portFromAddr(addr net.Addr) (int, error) {
+	if addr == nil {
+		return 0, fmt.Errorf("nil listener address")
+	}
+	if udp, ok := addr.(*net.UDPAddr); ok {
+		return udp.Port, nil
+	}
+
+	_, portStr, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return 0, fmt.Errorf("parse %q: %w", addr.String(), err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return 0, fmt.Errorf("parse port %q: %w", portStr, err)
+	}
+	return port, nil
 }
 
 type nodeDelegate struct {
@@ -178,6 +227,7 @@ func (d *nodeDelegate) LocalState(join bool) []byte                { return nil 
 func (d *nodeDelegate) MergeRemoteState(buf []byte, join bool)     {}
 
 func (n *Node) acceptLoop() {
+	defer n.wg.Done() // Mark acceptLoop as finished
 	for {
 		conn, err := n.quicLn.Accept(n.ctx)
 		if err != nil {
@@ -188,22 +238,38 @@ func (n *Node) acceptLoop() {
 				continue
 			}
 		}
+		n.wg.Add(1) // Track each handleConn goroutine
 		go n.handleConn(conn)
 	}
 }
 
 func (n *Node) handleConn(conn *quic.Conn) {
+	defer n.wg.Done() // Mark handleConn as finished
+	// Limit concurrent streams per connection to prevent goroutine explosion
+	const maxConcurrentStreams = 100
+	streamSem := make(chan struct{}, maxConcurrentStreams)
+
 	for {
 		stream, err := conn.AcceptStream(n.ctx)
 		if err != nil {
 			return
 		}
-		go n.handleStream(stream)
+
+		// Acquire semaphore slot (blocks if at limit)
+		select {
+		case streamSem <- struct{}{}:
+			go func(s *quic.Stream) {
+				defer func() { <-streamSem }() // Release slot when done
+				n.handleStream(s)
+			}(stream)
+		case <-n.ctx.Done():
+			return
+		}
 	}
 }
 
 func (n *Node) handleStream(stream *quic.Stream) {
-	defer stream.Close()
+	defer (*stream).Close()
 
 	decoder := json.NewDecoder(stream)
 	var req InterQueryReq
@@ -249,17 +315,32 @@ func (n *Node) getConn(targetNode string) (*quic.Conn, error) {
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	// Double-check: another goroutine may have already established the connection
 	if conn, ok := n.conns[targetNode]; ok {
 		return conn, nil
 	}
 
-	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"jaydb-quic"}}
+	tlsConf := &tls.Config{
+		// Note: For production, implement proper certificate verification
+		// This should use a CA pool and verify server identity
+		// InsecureSkipVerify is kept for local testing but should be removed
+		InsecureSkipVerify: true, // TODO: Remove for production
+		NextProtos:         []string{"jaydb-quic"},
+		MinVersion:         tls.VersionTLS13, // Enforce TLS 1.3+
+	}
 	conn, err := quic.DialAddr(n.ctx, targetNode, tlsConf, &quic.Config{
 		MaxIdleTimeout:  30 * time.Second,
 		KeepAlivePeriod: 10 * time.Second,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("quic dial error to %s: %w", targetNode, err)
+	}
+
+	// Check one more time in case another goroutine won the race while we were dialing
+	if existingConn, exists := n.conns[targetNode]; exists {
+		// Another goroutine already stored a connection - close ours and use theirs
+		_ = conn.CloseWithError(0, "duplicate connection")
+		return existingConn, nil
 	}
 
 	n.conns[targetNode] = conn
@@ -303,26 +384,63 @@ func (n *Node) ExecuteInterQuery(ctx context.Context, targetNode string, req Int
 	return &resp, nil
 }
 
-// SelfQuicAddr returns the node's QUIC address string.
+// SelfQuicAddr returns the node's QUIC address string, using the port actually
+// bound rather than the requested one, so it stays correct for ephemeral binds.
 func (n *Node) SelfQuicAddr() string {
-	return fmt.Sprintf("%s:%d", n.cfg.BindAddr, n.cfg.QuicPort)
+	return fmt.Sprintf("%s:%d", n.cfg.BindAddr, n.quicPort)
+}
+
+// QuicPort returns the QUIC mesh port actually bound. Call this after NewNode to
+// discover the assigned port when NodeConfig.QuicPort was 0.
+func (n *Node) QuicPort() int {
+	return n.quicPort
+}
+
+// BindPort returns the memberlist gossip port actually bound. Call this after
+// NewNode to discover the assigned port when NodeConfig.BindPort was 0; the
+// result is what peers should be given as a JoinAddrs entry.
+func (n *Node) BindPort() int {
+	return n.bindPort
+}
+
+// GossipAddr returns the host:port other nodes should use to join this node.
+func (n *Node) GossipAddr() string {
+	return fmt.Sprintf("%s:%d", n.cfg.BindAddr, n.bindPort)
 }
 
 // Close gracefully terminates node connection pool and memberlist.
+//
+// Close is idempotent and safe to call concurrently: memberlist panics if Leave
+// is invoked after Shutdown, and a Node is routinely closed twice in practice
+// because db.Close also closes the ClusterNode it was configured with (so a
+// caller holding both a Node and a DB has no single correct shutdown order).
 func (n *Node) Close() error {
-	n.cancel()
-	if n.mlist != nil {
-		_ = n.mlist.Leave(2 * time.Second)
-		_ = n.mlist.Shutdown()
-	}
-	if n.quicLn != nil {
-		_ = n.quicLn.Close()
-	}
-	n.mu.Lock()
-	for _, conn := range n.conns {
-		_ = conn.CloseWithError(0, "node closing")
-	}
-	n.mu.Unlock()
+	n.closeOnce.Do(func() {
+		// Signal shutdown to all goroutines
+		n.cancel()
+
+		// Leave memberlist gracefully
+		if n.mlist != nil {
+			_ = n.mlist.Leave(2 * time.Second)
+			_ = n.mlist.Shutdown()
+		}
+
+		// Close QUIC listener (stops accepting new connections)
+		if n.quicLn != nil {
+			_ = n.quicLn.Close()
+		}
+
+		// Close all existing connections
+		n.mu.Lock()
+		for _, conn := range n.conns {
+			_ = conn.CloseWithError(0, "node closing")
+		}
+		n.mu.Unlock()
+
+		// Wait for all background goroutines to finish (acceptLoop and handleConn goroutines)
+		n.wg.Wait()
+	})
+
 	return nil
 }
 

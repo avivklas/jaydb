@@ -10,9 +10,12 @@ import (
 	"time"
 
 	"github.com/avivklas/jaydb/pkg/db"
+	"github.com/avivklas/jaydb/pkg/metrics"
 	"github.com/avivklas/jaydb/pkg/sharding"
 	"github.com/avivklas/jaydb/pkg/storage"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/valyala/fasthttp"
+	"github.com/valyala/fasthttp/fasthttpadaptor"
 )
 
 // Server encapsulates the FastHTTP server wrapper around the embedded DB engine.
@@ -50,7 +53,27 @@ func NewServer(opts Options) (*Server, error) {
 
 // HandleRequest is the main FastHTTP request handler.
 func (s *Server) HandleRequest(ctx *fasthttp.RequestCtx) {
+	start := time.Now()
 	path := string(ctx.Path())
+	method := string(ctx.Method())
+
+	// Defer metrics recording
+	defer func() {
+		duration := time.Since(start).Seconds()
+		status := fmt.Sprintf("%d", ctx.Response.StatusCode())
+		pathPrefix := s.getPathPrefix(path)
+		reqSize := len(ctx.PostBody())
+		respSize := len(ctx.Response.Body())
+
+		metrics.RecordHTTPRequest(method, pathPrefix, status, duration, reqSize, respSize)
+	}()
+
+	// Prometheus metrics endpoint
+	if path == "/metrics" {
+		promHandler := fasthttpadaptor.NewFastHTTPHandler(promhttp.Handler())
+		promHandler(ctx)
+		return
+	}
 
 	if path == "/v1/health" {
 		ctx.SetStatusCode(fasthttp.StatusOK)
@@ -64,6 +87,20 @@ func (s *Server) HandleRequest(ctx *fasthttp.RequestCtx) {
 		if key == "" {
 			ctx.Error("key path is required", fasthttp.StatusBadRequest)
 			return
+		}
+
+		// Security: Validate key length to prevent abuse
+		if len(key) > 1024 {
+			ctx.Error("key path too long (max 1024 bytes)", fasthttp.StatusBadRequest)
+			return
+		}
+
+		// Security: Validate key contains no control characters
+		for _, ch := range key {
+			if ch < 32 || ch == 127 {
+				ctx.Error("key contains invalid characters", fasthttp.StatusBadRequest)
+				return
+			}
 		}
 
 		// Inter-node forwarding check
@@ -97,7 +134,36 @@ func (s *Server) HandleRequest(ctx *fasthttp.RequestCtx) {
 	ctx.Error("not found", fasthttp.StatusNotFound)
 }
 
+// getPathPrefix extracts the path prefix for metrics labeling
+func (s *Server) getPathPrefix(path string) string {
+	if path == "/metrics" {
+		return "/metrics"
+	}
+	if path == "/v1/health" {
+		return "/v1/health"
+	}
+	if strings.HasPrefix(path, "/v1/kv/") {
+		return "/v1/kv"
+	}
+	if strings.HasPrefix(path, "/v1/list/") {
+		return "/v1/list"
+	}
+	return "unknown"
+}
+
 func (s *Server) proxyToNode(ctx *fasthttp.RequestCtx, targetNode string) {
+	// Security: Prevent forwarding loops by rejecting already-forwarded requests
+	if ctx.Request.Header.Peek("X-Forwarded-By") != nil {
+		ctx.Error("forwarding loop detected", fasthttp.StatusBadRequest)
+		return
+	}
+
+	// Security: Validate target node is actually in the ring to prevent SSRF
+	if s.ring != nil && !s.ring.HasNode(targetNode) {
+		ctx.Error("invalid target node", fasthttp.StatusBadRequest)
+		return
+	}
+
 	req := fasthttp.AcquireRequest()
 	resp := fasthttp.AcquireResponse()
 	defer fasthttp.ReleaseRequest(req)
@@ -110,17 +176,27 @@ func (s *Server) proxyToNode(ctx *fasthttp.RequestCtx, targetNode string) {
 	req.Header.Set("X-Forwarded-By", s.nodeAddr)
 
 	if err := s.client.Do(req, resp); err != nil {
+		metrics.ClusterForwardedRequests.WithLabelValues(targetNode, "error").Inc()
 		ctx.Error(fmt.Sprintf("proxy to node %s error: %v", targetNode, err), fasthttp.StatusBadGateway)
 		return
 	}
 
+	metrics.ClusterForwardedRequests.WithLabelValues(targetNode, "success").Inc()
 	resp.CopyTo(&ctx.Response)
 }
 
 func (s *Server) handleGet(ctx *fasthttp.RequestCtx, key string) {
+	// Use request context with timeout instead of Background()
+	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
 	var rawData []byte
-	meta, err := s.db.Get(context.Background(), key, &rawData)
+	meta, err := s.db.Get(reqCtx, key, &rawData)
+	duration := time.Since(start).Seconds()
+
 	if err != nil {
+		metrics.RecordDBOperation("get", "error", duration)
 		if err == storage.ErrNotFound {
 			ctx.Error("document not found", fasthttp.StatusNotFound)
 			return
@@ -128,6 +204,8 @@ func (s *Server) handleGet(ctx *fasthttp.RequestCtx, key string) {
 		ctx.Error(err.Error(), fasthttp.StatusInternalServerError)
 		return
 	}
+
+	metrics.RecordDBOperation("get", "success", duration)
 
 	ctx.Response.Header.Set("ETag", meta.ETag)
 	ctx.SetContentType("application/json")
@@ -142,6 +220,17 @@ func (s *Server) handlePut(ctx *fasthttp.RequestCtx, key string) {
 		return
 	}
 
+	// Security: Enforce maximum body size (10MB default)
+	const maxBodySize = 10 * 1024 * 1024
+	if len(body) > maxBodySize {
+		ctx.Error("request body too large (max 10MB)", fasthttp.StatusRequestEntityTooLarge)
+		return
+	}
+
+	// Use request context with timeout
+	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	ifMatch := string(ctx.Request.Header.Peek("If-Match"))
 	ifNoneMatch := string(ctx.Request.Header.Peek("If-None-Match"))
 
@@ -152,15 +241,23 @@ func (s *Server) handlePut(ctx *fasthttp.RequestCtx, key string) {
 		putOpts = append(putOpts, db.WithExpectedETag(ifMatch))
 	}
 
-	meta, err := s.db.Put(context.Background(), key, body, putOpts...)
+	start := time.Now()
+	meta, err := s.db.Put(reqCtx, key, body, putOpts...)
+	duration := time.Since(start).Seconds()
+
 	if err != nil {
 		if err == storage.ErrVersionMismatch || err == storage.ErrAlreadyExists {
+			metrics.CASConflicts.WithLabelValues("put").Inc()
+			metrics.RecordDBOperation("put", "cas_conflict", duration)
 			ctx.Error("CAS precondition failed: "+err.Error(), fasthttp.StatusPreconditionFailed)
 			return
 		}
+		metrics.RecordDBOperation("put", "error", duration)
 		ctx.Error(err.Error(), fasthttp.StatusInternalServerError)
 		return
 	}
+
+	metrics.RecordDBOperation("put", "success", duration)
 
 	ctx.Response.Header.Set("ETag", meta.ETag)
 	ctx.SetContentType("application/json")
@@ -170,6 +267,10 @@ func (s *Server) handlePut(ctx *fasthttp.RequestCtx, key string) {
 }
 
 func (s *Server) handleDelete(ctx *fasthttp.RequestCtx, key string) {
+	// Use request context with timeout
+	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	ifMatch := string(ctx.Request.Header.Peek("If-Match"))
 
 	var delOpts []db.DeleteOption
@@ -177,34 +278,58 @@ func (s *Server) handleDelete(ctx *fasthttp.RequestCtx, key string) {
 		delOpts = append(delOpts, db.WithDeleteExpectedETag(ifMatch))
 	}
 
-	err := s.db.Delete(context.Background(), key, delOpts...)
+	start := time.Now()
+	err := s.db.Delete(reqCtx, key, delOpts...)
+	duration := time.Since(start).Seconds()
+
 	if err != nil {
 		if err == storage.ErrNotFound {
+			metrics.RecordDBOperation("delete", "not_found", duration)
 			ctx.Error("document not found", fasthttp.StatusNotFound)
 			return
 		}
 		if err == storage.ErrVersionMismatch {
+			metrics.CASConflicts.WithLabelValues("delete").Inc()
+			metrics.RecordDBOperation("delete", "cas_conflict", duration)
 			ctx.Error("CAS precondition failed", fasthttp.StatusPreconditionFailed)
 			return
 		}
+		metrics.RecordDBOperation("delete", "error", duration)
 		ctx.Error(err.Error(), fasthttp.StatusInternalServerError)
 		return
 	}
 
+	metrics.RecordDBOperation("delete", "success", duration)
 	ctx.SetStatusCode(fasthttp.StatusNoContent)
 }
 
 func (s *Server) handleList(ctx *fasthttp.RequestCtx, prefix string) {
+	// Use request context with timeout
+	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	limit := ctx.QueryArgs().GetUintOrZero("limit")
 	if limit == 0 {
 		limit = 100
 	}
 
-	items, err := s.db.List(context.Background(), prefix, limit)
+	// Security: Enforce maximum list limit to prevent resource exhaustion
+	const maxListLimit = 10000
+	if limit > maxListLimit {
+		limit = maxListLimit
+	}
+
+	start := time.Now()
+	items, err := s.db.List(reqCtx, prefix, limit)
+	duration := time.Since(start).Seconds()
+
 	if err != nil {
+		metrics.RecordDBOperation("list", "error", duration)
 		ctx.Error(err.Error(), fasthttp.StatusInternalServerError)
 		return
 	}
+
+	metrics.RecordDBOperation("list", "success", duration)
 
 	ctx.SetContentType("application/json")
 	ctx.SetStatusCode(fasthttp.StatusOK)

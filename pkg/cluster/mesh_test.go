@@ -38,12 +38,12 @@ func TestMemberlistAndQuicMesh(t *testing.T) {
 
 	h := &mockHandler{store: memStore}
 
-	// Node 1
+	// Node 1. Port 0 = OS-assigned, so parallel test packages cannot collide.
 	cfg1 := NodeConfig{
 		NodeName:  "node-1",
 		BindAddr:  "127.0.0.1",
-		BindPort:  19001,
-		QuicPort:  19002,
+		BindPort:  0,
+		QuicPort:  0,
 		Ring:      ring,
 		DBHandler: h,
 	}
@@ -53,13 +53,14 @@ func TestMemberlistAndQuicMesh(t *testing.T) {
 	}
 	defer node1.Close()
 
-	// Node 2 (Joins Node 1)
+	// Node 2 (Joins Node 1). node1's gossip port is only known once it is bound,
+	// so the join address has to be read back from the node itself.
 	cfg2 := NodeConfig{
 		NodeName:  "node-2",
 		BindAddr:  "127.0.0.1",
-		BindPort:  19003,
-		QuicPort:  19004,
-		JoinAddrs: []string{"127.0.0.1:19001"},
+		BindPort:  0,
+		QuicPort:  0,
+		JoinAddrs: []string{node1.GossipAddr()},
 		Ring:      ring,
 		DBHandler: h,
 	}
