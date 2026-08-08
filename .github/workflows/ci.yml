@@ -1,0 +1,55 @@
+name: CI
+
+# Runs on every PR and on main. Before this workflow existed the repo had no
+# automated checks at all, so a PR's only evidence was whatever the author ran
+# locally — and this module is consumed by a production service.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push to the same PR supersedes the previous run.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: build / vet / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Track the version the module declares rather than hardcoding one
+          # here, so a go.mod bump cannot silently leave CI on an older
+          # toolchain than the code is written against.
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d $unformatted
+            exit 1
+          fi
+
+      - name: Test (race detector)
+        # -race is the point of this step. The cache and cluster packages carry
+        # a shared byte accountant, an atomic CLOCK reference bit and a
+        # documented lock-ordering invariant between them; a plain test build
+        # cannot see a violation of any of it.
+        run: go test ./... -race -count=1
