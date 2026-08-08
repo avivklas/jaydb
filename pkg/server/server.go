@@ -206,6 +206,7 @@ func (s *Server) handleGet(ctx *fasthttp.RequestCtx, key string) {
 	}
 
 	metrics.RecordDBOperation("get", "success", duration)
+	metrics.ObserveObjectSize(len(rawData))
 
 	ctx.Response.Header.Set("ETag", meta.ETag)
 	ctx.SetContentType("application/json")
@@ -258,6 +259,7 @@ func (s *Server) handlePut(ctx *fasthttp.RequestCtx, key string) {
 	}
 
 	metrics.RecordDBOperation("put", "success", duration)
+	metrics.ObserveObjectSize(len(body))
 
 	ctx.Response.Header.Set("ETag", meta.ETag)
 	ctx.SetContentType("application/json")

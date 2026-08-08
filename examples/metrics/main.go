@@ -37,7 +37,7 @@ func main() {
 	collector := metrics.NewCollector(
 		database.Cache().Stats,
 		database.Cache().GetCacheSize,
-	)
+	).WithEvictionStats(database.Cache().EvictionStats)
 	collector.Start()
 	defer collector.Stop()
 
