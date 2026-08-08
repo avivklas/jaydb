@@ -55,6 +55,93 @@ func (b *Budget) Register(e Evictor) {
 	b.evictors = append(b.evictors, e)
 }
 
+// Unregister removes e as an eviction source and drops the bytes it still holds
+// from the budget. A process that opens one Manager per namespace and deletes
+// namespaces at runtime needs this: without it the Budget keeps every Manager it
+// ever saw reachable (leaking the whole cache), keeps their bytes counting
+// against the ceiling so live namespaces get less than the configured budget,
+// and grows Reserve's round-robin scan with every namespace ever opened rather
+// than the number currently open.
+//
+// Idempotent: unregistering an Evictor that was never registered, or
+// unregistering the same one twice, is a no-op.
+//
+// RELEASE SEMANTICS - Unregister drops the departing Evictor's bytes itself
+// rather than requiring the caller to purge first, so a caller only has to get
+// one call right. It drains e through the same EvictOldest contract Reserve
+// uses, which means every byte is subtracted exactly once, by the same
+// accountant that added it - Used() can neither keep the departed bytes nor go
+// negative. The alternative, purge-then-unregister, splits one invariant across
+// two call sites: a caller that forgets the purge silently shrinks every other
+// namespace's effective budget, and in the window between the two calls e is
+// still a live eviction target, so a concurrent Reserve can evict from it while
+// the purge is releasing the same bytes.
+//
+// The drain shows up in the departing Manager's own eviction counter, which is
+// harmless because that counter is discarded along with the Manager.
+//
+// e is matched by interface identity, so its dynamic type must be comparable -
+// *Manager is a pointer, which always is.
+//
+// Callers must not hold their own mutex here - the drain takes e's mutex, so
+// Budget.mu stays the OUTER lock exactly as it is in Reserve. See the
+// lock-ordering note on Budget.
+func (b *Budget) Unregister(e Evictor) {
+	if e == nil {
+		return
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	i := -1
+	for idx, existing := range b.evictors {
+		if existing == e {
+			i = idx
+			break
+		}
+	}
+	if i < 0 {
+		return
+	}
+
+	// Drain before removing. EvictOldest reports the bytes it freed and must not
+	// release them itself (see Evictor), so this loop is the only thing that can
+	// hand them back - and once e is out of the slice, nothing would ever ask it
+	// again. Terminates because each ok==true call removes exactly one entry.
+	for {
+		freed, ok := e.EvictOldest()
+		if !ok {
+			break
+		}
+		b.used -= freed
+		if b.used < 0 {
+			b.used = 0
+		}
+	}
+
+	// Order-preserving removal, so the survivors keep their round-robin
+	// sequence. The vacated tail slot is cleared explicitly: leaving the old
+	// pointer in the backing array would keep the departed Manager and its whole
+	// cache reachable, which is the leak this method exists to close.
+	last := len(b.evictors) - 1
+	copy(b.evictors[i:], b.evictors[i+1:])
+	b.evictors[last] = nil
+	b.evictors = b.evictors[:last]
+
+	// Removal shifts every later index down by one, so a cursor past the removal
+	// point must follow it or Reserve skips an Evictor, and a cursor left at or
+	// beyond the new length must wrap or Reserve indexes out of range.
+	if b.cursor > i {
+		b.cursor--
+	}
+	if len(b.evictors) == 0 {
+		b.cursor = 0
+	} else if b.cursor >= len(b.evictors) {
+		b.cursor %= len(b.evictors)
+	}
+}
+
 // Reserve accounts for n bytes about to be cached, evicting across registered
 // Managers if that is what it takes to fit. It reports false when even a fully
 // drained cache could not make room, in which case the caller must not cache
