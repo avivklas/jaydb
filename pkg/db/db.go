@@ -34,6 +34,13 @@ type Options struct {
 	ShardingDepth int
 	Ring          *sharding.Ring
 	ClusterNode   *cluster.Node
+
+	// Namespace identifies this database within a clustered process that hosts
+	// several of them. It is required for inter-query routing to be correct
+	// when more than one DB shares a ClusterNode: the wire request carries the
+	// namespace so the owner node can pick the matching local DB. Leave empty
+	// for a single embedded database.
+	Namespace string
 }
 
 // PutOptions specifies options for write operations.
@@ -107,12 +114,21 @@ func Open(opts Options) (DB, error) {
 
 	cacheMgr := cache.NewManager(opts.Storage)
 
-	return &database{
+	d := &database{
 		opts:         opts,
 		cacheMgr:     cacheMgr,
 		codec:        opts.Codec,
 		storageDrive: opts.Storage,
-	}, nil
+	}
+
+	// Register as the owner-side handler for this namespace. Without this the
+	// cluster node has nothing to serve forwarded requests with, and peers
+	// received an empty response that looked exactly like a missing document.
+	if opts.ClusterNode != nil {
+		opts.ClusterNode.RegisterHandler(opts.Namespace, d)
+	}
+
+	return d, nil
 }
 
 func (d *database) Get(ctx context.Context, key string, dest any) (*Meta, error) {
@@ -122,8 +138,9 @@ func (d *database) Get(ctx context.Context, key string, dest any) (*Meta, error)
 		selfAddr := d.opts.ClusterNode.SelfQuicAddr()
 		if targetNode != "" && targetNode != selfAddr {
 			resp, err := d.opts.ClusterNode.ExecuteInterQuery(ctx, targetNode, cluster.InterQueryReq{
-				Op:  cluster.OpGet,
-				Key: key,
+				Namespace: d.opts.Namespace,
+				Op:        cluster.OpGet,
+				Key:       key,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("inter-query error: %w", err)
@@ -131,13 +148,17 @@ func (d *database) Get(ctx context.Context, key string, dest any) (*Meta, error)
 			if resp.Err != "" {
 				return nil, mapErrorString(resp.Err)
 			}
-			if dest != nil && resp.Object != nil {
+			// A genuinely absent document always arrives as resp.Err ==
+			// storage.ErrNotFound. So "no object and no error" means the peer
+			// could not answer - reporting that as ErrNotFound is what made a
+			// broken mesh look like data loss.
+			if resp.Object == nil {
+				return nil, fmt.Errorf("inter-query to %s: %w", targetNode, cluster.ErrIncompleteResponse)
+			}
+			if dest != nil {
 				if err := d.codec.Unmarshal(resp.Object.Value, dest); err != nil {
 					return nil, fmt.Errorf("db decode error: %w", err)
 				}
-			}
-			if resp.Object == nil {
-				return nil, storage.ErrNotFound
 			}
 			return &Meta{
 				Key:     resp.Object.Key,
@@ -182,6 +203,7 @@ func (d *database) Put(ctx context.Context, key string, doc any, opts ...PutOpti
 		selfAddr := d.opts.ClusterNode.SelfQuicAddr()
 		if targetNode != "" && targetNode != selfAddr {
 			resp, err := d.opts.ClusterNode.ExecuteInterQuery(ctx, targetNode, cluster.InterQueryReq{
+				Namespace:    d.opts.Namespace,
 				Op:           cluster.OpPut,
 				Key:          key,
 				Value:        data,
@@ -192,6 +214,11 @@ func (d *database) Put(ctx context.Context, key string, doc any, opts ...PutOpti
 			}
 			if resp.Err != "" {
 				return nil, mapErrorString(resp.Err)
+			}
+			// Guard the dereference: a peer that answered with neither an object
+			// nor an error would otherwise panic the process here.
+			if resp.Object == nil {
+				return nil, fmt.Errorf("inter-query to %s: %w", targetNode, cluster.ErrIncompleteResponse)
 			}
 			return &Meta{
 				Key:     resp.Object.Key,
@@ -225,6 +252,7 @@ func (d *database) Delete(ctx context.Context, key string, opts ...DeleteOption)
 		selfAddr := d.opts.ClusterNode.SelfQuicAddr()
 		if targetNode != "" && targetNode != selfAddr {
 			resp, err := d.opts.ClusterNode.ExecuteInterQuery(ctx, targetNode, cluster.InterQueryReq{
+				Namespace:    d.opts.Namespace,
 				Op:           cluster.OpDelete,
 				Key:          key,
 				ExpectedETag: do.ExpectedETag,
@@ -287,6 +315,10 @@ func (d *database) PartitionKey(key string) string {
 
 func (d *database) Close() error {
 	if d.opts.ClusterNode != nil {
+		// Stop serving forwarded requests for this namespace before tearing the
+		// storage driver down, so peers get an explicit error instead of hitting
+		// a closed driver.
+		d.opts.ClusterNode.UnregisterHandler(d.opts.Namespace)
 		_ = d.opts.ClusterNode.Close()
 	}
 	return d.storageDrive.Close()

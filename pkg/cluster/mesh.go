@@ -2,12 +2,17 @@ package cluster
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -30,15 +35,64 @@ const (
 	OpDelete
 )
 
+// ErrNoHandler is returned when the owner node has no DB registered for the
+// requested namespace. It is deliberately distinct from storage.ErrNotFound:
+// "I am not serving that namespace" must never be mistaken for "that document
+// does not exist". Conflating the two once caused a production incident where
+// roughly half of all reads reported missing documents while the data was
+// intact.
+var ErrNoHandler = errors.New("jaydb cluster: no DB handler registered for namespace")
+
+// ErrIncompleteResponse is returned when a peer answers with neither an object
+// nor an error. That is a protocol violation, not an empty result.
+var ErrIncompleteResponse = errors.New("jaydb cluster: peer returned neither an object nor an error")
+
+// ErrUnauthenticated is returned when a request fails cluster secret verification.
+var ErrUnauthenticated = errors.New("jaydb cluster: request authentication failed")
+
+// authSkew bounds how far a request timestamp may drift from the receiver's
+// clock. It caps the replay window for a captured, correctly-signed request.
+const authSkew = 30 * time.Second
+
 // InterQueryReq is sent over a QUIC stream to request an operation on the key owner node.
 type InterQueryReq struct {
+	// Namespace selects which registered DB serves this request. A single
+	// process commonly hosts many namespaces (one per tenant database), so the
+	// key alone is ambiguous. Empty means "the legacy single handler", which
+	// keeps embedded single-database users working unchanged.
+	Namespace    string `json:"namespace,omitempty"`
 	Op           OpType `json:"op"`
 	Key          string `json:"key"`
 	Value        []byte `json:"value,omitempty"`
 	ExpectedETag string `json:"expected_etag,omitempty"`
+
+	// TS and Auth carry request authentication when a ClusterSecret is
+	// configured. Auth is an HMAC over the request's canonical form, so a peer
+	// cannot be induced to read or delete arbitrary keys by anything that
+	// merely reaches the mesh port.
+	TS   int64  `json:"ts,omitempty"`
+	Auth string `json:"auth,omitempty"`
+}
+
+// signingString is the canonical form covered by Auth. Value is hashed rather
+// than embedded so signing cost stays constant for large documents.
+func (r InterQueryReq) signingString() string {
+	sum := sha256.Sum256(r.Value)
+	return fmt.Sprintf("v1\n%d\n%s\n%d\n%s\n%s\n%s",
+		r.TS, r.Namespace, r.Op, r.Key, r.ExpectedETag, hex.EncodeToString(sum[:]))
+}
+
+func computeAuth(secret string, req InterQueryReq) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(req.signingString()))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // InterQueryResp is returned over a QUIC stream from the key owner node.
+//
+// Contract: exactly one of Object or Err is always set. A response with
+// neither is a protocol violation and callers must surface it as an error
+// rather than as an absent document.
 type InterQueryResp struct {
 	Object *storage.Object `json:"object,omitempty"`
 	Err    string          `json:"err,omitempty"`
@@ -65,7 +119,59 @@ type NodeConfig struct {
 	QuicPort  int
 	JoinAddrs []string
 	Ring      *sharding.Ring
+
+	// DBHandler is the legacy single-database handler, used only for requests
+	// that carry no namespace. Multi-namespace deployments call
+	// Node.RegisterHandler instead.
 	DBHandler Handler
+
+	// ClusterSecret authenticates inter-query requests. The inter-query
+	// protocol is raw Get/Put/DeleteRaw over the whole keyspace, so without a
+	// secret anything that can reach the mesh port can read or delete any
+	// document. Leave empty only for single-tenant local development.
+	ClusterSecret string
+
+	// DialTimeout bounds establishing a QUIC connection to a peer. Without it
+	// a dial is bounded only by MaxIdleTimeout (30s), which turns one
+	// unreachable peer into 30s request stalls. Default defaultDialTimeout.
+	DialTimeout time.Duration
+
+	// StreamOpenTimeout bounds opening a stream on an already-cached
+	// connection. A peer that vanished leaves a conn that looks alive, and
+	// OpenStreamSync on it parks until the idle timeout expires.
+	// Default defaultStreamOpenTimeout.
+	StreamOpenTimeout time.Duration
+
+	// RequestTimeout bounds how long the owner node spends serving one
+	// inter-query before abandoning it. Default defaultRequestTimeout.
+	RequestTimeout time.Duration
+}
+
+const (
+	defaultDialTimeout       = 3 * time.Second
+	defaultStreamOpenTimeout = 3 * time.Second
+	defaultRequestTimeout    = 10 * time.Second
+)
+
+func (c NodeConfig) dialTimeout() time.Duration {
+	if c.DialTimeout > 0 {
+		return c.DialTimeout
+	}
+	return defaultDialTimeout
+}
+
+func (c NodeConfig) streamOpenTimeout() time.Duration {
+	if c.StreamOpenTimeout > 0 {
+		return c.StreamOpenTimeout
+	}
+	return defaultStreamOpenTimeout
+}
+
+func (c NodeConfig) requestTimeout() time.Duration {
+	if c.RequestTimeout > 0 {
+		return c.RequestTimeout
+	}
+	return defaultRequestTimeout
 }
 
 // Node manages memberlist cluster membership and QUIC inter-query connection mesh.
@@ -87,6 +193,78 @@ type Node struct {
 	// SelfQuicAddr) must be built from these and never from cfg.
 	bindPort int
 	quicPort int
+
+	// handlers maps namespace -> local DB. One process serves many namespaces,
+	// so the owner node must be told which one a request refers to.
+	handlersMu sync.RWMutex
+	handlers   map[string]Handler
+
+	// dialLocks serializes concurrent dials to the SAME peer without blocking
+	// dials to other peers or lookups of existing connections. Dialing while
+	// holding the node-wide mutex made one unreachable peer stall every
+	// inter-query in the process.
+	dialLocksMu sync.Mutex
+	dialLocks   map[string]*sync.Mutex
+}
+
+// RegisterHandler registers the local DB that serves namespace. Safe to call
+// concurrently and after the node is running; db.Open calls it automatically
+// when both a Ring and a ClusterNode are configured.
+func (n *Node) RegisterHandler(namespace string, h Handler) {
+	n.handlersMu.Lock()
+	defer n.handlersMu.Unlock()
+	if n.handlers == nil {
+		n.handlers = make(map[string]Handler)
+	}
+	n.handlers[namespace] = h
+}
+
+// UnregisterHandler removes a namespace's handler, so a closed DB stops
+// receiving forwarded requests.
+func (n *Node) UnregisterHandler(namespace string) {
+	n.handlersMu.Lock()
+	defer n.handlersMu.Unlock()
+	delete(n.handlers, namespace)
+}
+
+// handlerFor resolves the handler serving namespace. An empty namespace maps to
+// the legacy single DBHandler so embedded single-database callers keep working.
+func (n *Node) handlerFor(namespace string) (Handler, bool) {
+	if namespace == "" {
+		if n.cfg.DBHandler != nil {
+			return n.cfg.DBHandler, true
+		}
+		return nil, false
+	}
+
+	n.handlersMu.RLock()
+	h, ok := n.handlers[namespace]
+	n.handlersMu.RUnlock()
+	if ok {
+		return h, true
+	}
+
+	// Fall back to the legacy handler so a single-DB deployment that started
+	// passing a namespace does not break.
+	if n.cfg.DBHandler != nil {
+		return n.cfg.DBHandler, true
+	}
+	return nil, false
+}
+
+// dialLockFor returns the per-peer dial mutex, creating it on first use.
+func (n *Node) dialLockFor(target string) *sync.Mutex {
+	n.dialLocksMu.Lock()
+	defer n.dialLocksMu.Unlock()
+	if n.dialLocks == nil {
+		n.dialLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := n.dialLocks[target]
+	if !ok {
+		mu = &sync.Mutex{}
+		n.dialLocks[target] = mu
+	}
+	return mu
 }
 
 type eventDelegate struct {
@@ -277,58 +455,132 @@ func (n *Node) handleStream(stream *quic.Stream) {
 		return
 	}
 
-	var resp InterQueryResp
-	if n.cfg.DBHandler != nil {
-		switch req.Op {
-		case OpGet:
-			obj, err := n.cfg.DBHandler.GetRaw(n.ctx, req.Key)
-			if err != nil {
-				resp.Err = err.Error()
-			} else {
-				resp.Object = obj
-			}
-		case OpPut:
-			obj, err := n.cfg.DBHandler.PutRaw(n.ctx, req.Key, req.Value, req.ExpectedETag)
-			if err != nil {
-				resp.Err = err.Error()
-			} else {
-				resp.Object = obj
-			}
-		case OpDelete:
-			err := n.cfg.DBHandler.DeleteRaw(n.ctx, req.Key, req.ExpectedETag)
-			if err != nil {
-				resp.Err = err.Error()
-			}
-		}
-	}
-
+	resp := n.serve(req)
 	_ = json.NewEncoder(stream).Encode(&resp)
 }
 
-func (n *Node) getConn(targetNode string) (*quic.Conn, error) {
-	n.mu.RLock()
-	conn, ok := n.conns[targetNode]
-	n.mu.RUnlock()
-	if ok {
+// serve executes one inter-query request and ALWAYS returns a response with
+// exactly one of Object or Err populated. Returning an empty response on an
+// unserviceable request is what previously made a misconfigured mesh
+// indistinguishable from missing data.
+func (n *Node) serve(req InterQueryReq) InterQueryResp {
+	if err := n.authenticate(req); err != nil {
+		return InterQueryResp{Err: err.Error()}
+	}
+
+	handler, ok := n.handlerFor(req.Namespace)
+	if !ok {
+		// Fail loud. The caller must be able to tell this apart from a genuinely
+		// absent document.
+		return InterQueryResp{Err: fmt.Sprintf("%s %q", ErrNoHandler.Error(), req.Namespace)}
+	}
+
+	// Bound the work: without a deadline the owner could hold a stream open for
+	// as long as its storage backend takes to answer.
+	ctx, cancel := context.WithTimeout(n.ctx, n.cfg.requestTimeout())
+	defer cancel()
+
+	switch req.Op {
+	case OpGet:
+		obj, err := handler.GetRaw(ctx, req.Key)
+		if err != nil {
+			return InterQueryResp{Err: err.Error()}
+		}
+		if obj == nil {
+			// A nil object with no error would serialize to an empty response.
+			return InterQueryResp{Err: storage.ErrNotFound.Error()}
+		}
+		return InterQueryResp{Object: obj}
+
+	case OpPut:
+		obj, err := handler.PutRaw(ctx, req.Key, req.Value, req.ExpectedETag)
+		if err != nil {
+			return InterQueryResp{Err: err.Error()}
+		}
+		if obj == nil {
+			return InterQueryResp{Err: "jaydb cluster: put returned no object"}
+		}
+		return InterQueryResp{Object: obj}
+
+	case OpDelete:
+		if err := handler.DeleteRaw(ctx, req.Key, req.ExpectedETag); err != nil {
+			return InterQueryResp{Err: err.Error()}
+		}
+		// Delete has no object to return; an empty Err means success. This is
+		// the one operation where both fields are legitimately empty, and the
+		// client only inspects Object for Get/Put.
+		return InterQueryResp{}
+
+	default:
+		return InterQueryResp{Err: fmt.Sprintf("jaydb cluster: unknown op %d", req.Op)}
+	}
+}
+
+// authenticate verifies the request HMAC when a cluster secret is configured.
+func (n *Node) authenticate(req InterQueryReq) error {
+	if n.cfg.ClusterSecret == "" {
+		return nil
+	}
+
+	if req.Auth == "" {
+		return ErrUnauthenticated
+	}
+	// Reject stale requests so a captured signed request cannot be replayed
+	// indefinitely.
+	skew := time.Since(time.Unix(req.TS, 0))
+	if skew < 0 {
+		skew = -skew
+	}
+	if skew > authSkew {
+		return ErrUnauthenticated
+	}
+
+	want := computeAuth(n.cfg.ClusterSecret, req)
+	if subtle.ConstantTimeCompare([]byte(want), []byte(req.Auth)) != 1 {
+		return ErrUnauthenticated
+	}
+	return nil
+}
+
+// getConn returns a connection to targetNode, dialing if necessary.
+//
+// The dial happens under a PER-PEER lock and is bounded by both the caller's
+// context and DialTimeout. Previously it ran while holding the node-wide mutex
+// on the node's lifetime context, so a single unreachable peer serialized every
+// inter-query in the process for up to MaxIdleTimeout (30s).
+func (n *Node) getConn(ctx context.Context, targetNode string) (*quic.Conn, error) {
+	if conn, ok := n.cachedConn(targetNode); ok {
 		return conn, nil
 	}
 
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	// Double-check: another goroutine may have already established the connection
-	if conn, ok := n.conns[targetNode]; ok {
+	dialMu := n.dialLockFor(targetNode)
+	dialMu.Lock()
+	defer dialMu.Unlock()
+
+	// Another goroutine may have dialed this peer while we waited.
+	if conn, ok := n.cachedConn(targetNode); ok {
 		return conn, nil
 	}
 
 	tlsConf := &tls.Config{
-		// Note: For production, implement proper certificate verification
-		// This should use a CA pool and verify server identity
-		// InsecureSkipVerify is kept for local testing but should be removed
-		InsecureSkipVerify: true, // TODO: Remove for production
+		// Peer identity is established by the ClusterSecret HMAC on every
+		// request rather than by PKI; the certificate is ephemeral and
+		// self-signed, so verifying it would prove nothing. Set ClusterSecret
+		// in any deployment where the mesh port is reachable by anything you do
+		// not control.
+		InsecureSkipVerify: true, //nolint:gosec // authenticated at the request layer
 		NextProtos:         []string{"jaydb-quic"},
-		MinVersion:         tls.VersionTLS13, // Enforce TLS 1.3+
+		MinVersion:         tls.VersionTLS13,
 	}
-	conn, err := quic.DialAddr(n.ctx, targetNode, tlsConf, &quic.Config{
+
+	// Bound by the caller's deadline AND the node's lifetime: a request that is
+	// abandoned must not leave a dial running, and shutdown must not wait on one.
+	dialCtx, cancel := context.WithTimeout(ctx, n.cfg.dialTimeout())
+	defer cancel()
+	stop := context.AfterFunc(n.ctx, cancel)
+	defer stop()
+
+	conn, err := quic.DialAddr(dialCtx, targetNode, tlsConf, &quic.Config{
 		MaxIdleTimeout:  30 * time.Second,
 		KeepAlivePeriod: 10 * time.Second,
 	})
@@ -336,48 +588,96 @@ func (n *Node) getConn(targetNode string) (*quic.Conn, error) {
 		return nil, fmt.Errorf("quic dial error to %s: %w", targetNode, err)
 	}
 
-	// Check one more time in case another goroutine won the race while we were dialing
-	if existingConn, exists := n.conns[targetNode]; exists {
-		// Another goroutine already stored a connection - close ours and use theirs
+	n.mu.Lock()
+	if existing, exists := n.conns[targetNode]; exists {
+		n.mu.Unlock()
 		_ = conn.CloseWithError(0, "duplicate connection")
-		return existingConn, nil
+		return existing, nil
+	}
+	n.conns[targetNode] = conn
+	n.mu.Unlock()
+
+	return conn, nil
+}
+
+// cachedConn returns a live cached connection, discarding one whose peer has
+// gone away. Without the liveness check, OpenStreamSync on a dead connection
+// blocks until MaxIdleTimeout rather than failing fast.
+func (n *Node) cachedConn(targetNode string) (*quic.Conn, bool) {
+	n.mu.RLock()
+	conn, ok := n.conns[targetNode]
+	n.mu.RUnlock()
+	if !ok {
+		return nil, false
 	}
 
-	n.conns[targetNode] = conn
-	return conn, nil
+	select {
+	case <-conn.Context().Done():
+		n.dropConn(targetNode, conn)
+		return nil, false
+	default:
+		return conn, true
+	}
+}
+
+// dropConn removes conn from the pool only if it is still the pooled entry, so
+// a concurrent redial is not discarded.
+func (n *Node) dropConn(targetNode string, conn *quic.Conn) {
+	n.mu.Lock()
+	if current, ok := n.conns[targetNode]; ok && current == conn {
+		delete(n.conns, targetNode)
+	}
+	n.mu.Unlock()
+	if conn != nil {
+		_ = conn.CloseWithError(0, "stale connection")
+	}
 }
 
 // ExecuteInterQuery routes an inter-query operation to targetNode over QUIC mesh.
 func (n *Node) ExecuteInterQuery(ctx context.Context, targetNode string, req InterQueryReq) (*InterQueryResp, error) {
-	conn, err := n.getConn(targetNode)
+	if n.cfg.ClusterSecret != "" {
+		req.TS = time.Now().Unix()
+		req.Auth = computeAuth(n.cfg.ClusterSecret, req)
+	}
+
+	resp, err := n.roundTrip(ctx, targetNode, req)
+	if err == nil {
+		return resp, nil
+	}
+	// One retry: the cached connection may have died between the liveness check
+	// and the stream open.
+	if ctx.Err() != nil {
+		return nil, err
+	}
+	return n.roundTrip(ctx, targetNode, req)
+}
+
+func (n *Node) roundTrip(ctx context.Context, targetNode string, req InterQueryReq) (*InterQueryResp, error) {
+	conn, err := n.getConn(ctx, targetNode)
 	if err != nil {
 		return nil, err
 	}
 
-	stream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		// Close stale conn and retry once
-		n.mu.Lock()
-		delete(n.conns, targetNode)
-		n.mu.Unlock()
+	// Bound stream establishment separately from the dial: a connection can be
+	// cached and apparently healthy while its peer no longer responds.
+	openCtx, cancel := context.WithTimeout(ctx, n.cfg.streamOpenTimeout())
+	defer cancel()
 
-		conn, err = n.getConn(targetNode)
-		if err != nil {
-			return nil, err
-		}
-		stream, err = conn.OpenStreamSync(ctx)
-		if err != nil {
-			return nil, err
-		}
+	stream, err := conn.OpenStreamSync(openCtx)
+	if err != nil {
+		n.dropConn(targetNode, conn)
+		return nil, fmt.Errorf("quic open stream to %s: %w", targetNode, err)
 	}
 	defer stream.Close()
 
 	if err := json.NewEncoder(stream).Encode(&req); err != nil {
+		n.dropConn(targetNode, conn)
 		return nil, err
 	}
 
 	var resp InterQueryResp
 	if err := json.NewDecoder(stream).Decode(&resp); err != nil {
+		n.dropConn(targetNode, conn)
 		return nil, err
 	}
 
