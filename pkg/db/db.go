@@ -536,6 +536,17 @@ func (d *database) Close() error {
 		d.opts.ClusterNode.UnregisterHandler(d.opts.Namespace)
 		_ = d.opts.ClusterNode.Close()
 	}
+
+	// Hand this database's cached bytes back to the shared budget and stop being
+	// an eviction target. A process that opens one DB per namespace and deletes
+	// namespaces at runtime would otherwise leak every closed namespace's cache
+	// for the life of the process, and charge its bytes to the ceiling that the
+	// surviving namespaces have to share. Unregister drains the Manager, so
+	// nothing else has to purge first.
+	if budget := d.cacheMgr.Budget(); budget != nil {
+		budget.Unregister(d.cacheMgr)
+	}
+
 	return d.storageDrive.Close()
 }
 
