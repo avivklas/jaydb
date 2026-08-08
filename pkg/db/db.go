@@ -19,6 +19,11 @@ type Meta struct {
 	Key     string    `json:"key"`
 	ETag    string    `json:"etag"`
 	ModTime time.Time `json:"mod_time"`
+
+	// Size is the stored byte size of the document. Populated by listings,
+	// where the storage layer reports it without transferring the payload, so
+	// callers can measure a keyspace without reading it.
+	Size int64 `json:"size,omitempty"`
 }
 
 // Item represents a listed key along with optional unmarshaled content or raw bytes.
@@ -85,6 +90,9 @@ type DB interface {
 	Put(ctx context.Context, key string, doc any, opts ...PutOption) (*Meta, error)
 	Delete(ctx context.Context, key string, opts ...DeleteOption) error
 	List(ctx context.Context, prefix string, limit int) ([]*Item, error)
+	// ListPage returns one page of keys plus a cursor for the next page. An
+	// empty returned cursor means the keyspace is exhausted.
+	ListPage(ctx context.Context, prefix string, opts ListPageOptions) (items []*Item, next string, err error)
 	Cache() *cache.Manager
 	ShardingDepth() int
 	GetRaw(ctx context.Context, key string) (*storage.Object, error)
@@ -282,23 +290,98 @@ func (d *database) DeleteRaw(ctx context.Context, key string, expectedETag strin
 	return d.cacheMgr.Delete(ctx, key, expectedETag)
 }
 
+// listPageSize is the number of keys requested from storage per underlying
+// listing call. It matches the S3 maximum, which is the tightest limit among the
+// drivers, so one page here is always exactly one storage request.
+const listPageSize = 1000
+
+// ListPageOptions configures a single page of a listing.
+type ListPageOptions struct {
+	// Limit caps the number of keys in this page. Zero or negative means the
+	// driver's natural page size (listPageSize).
+	Limit int
+
+	// Cursor resumes after a previous page. Empty starts from the beginning.
+	Cursor string
+}
+
+// List returns up to limit keys under prefix.
+//
+// The limit is honored across page boundaries. This used to issue exactly one
+// storage listing and pass the limit straight through, discarding the cursor the
+// driver returned - so on S3, which caps a response at 1000 keys no matter what
+// MaxKeys asks for, List(prefix, 5000) silently returned 1000 keys and no
+// indication that more existed. Every caller inherited that truncation: a
+// listing endpoint under-reported, and anything counting a keyspace stopped
+// counting at 1000.
+//
+// A limit of zero or less means "every matching key", which is unbounded by
+// definition - prefer ListPage when the keyspace may be large.
 func (d *database) List(ctx context.Context, prefix string, limit int) ([]*Item, error) {
-	metas, _, err := d.storageDrive.List(ctx, prefix, storage.ListOptions{Limit: limit})
-	if err != nil {
-		return nil, err
+	var (
+		items  []*Item
+		cursor string
+	)
+
+	for {
+		pageLimit := listPageSize
+		if limit > 0 {
+			if remaining := limit - len(items); remaining < pageLimit {
+				pageLimit = remaining
+			}
+		}
+
+		page, next, err := d.ListPage(ctx, prefix, ListPageOptions{
+			Limit:  pageLimit,
+			Cursor: cursor,
+		})
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, page...)
+
+		if limit > 0 && len(items) >= limit {
+			return items[:limit], nil
+		}
+		// A cursor with no keys behind it means no progress: stop rather than
+		// spin, so a driver that reports a stale cursor cannot hang the caller.
+		if next == "" || len(page) == 0 {
+			return items, nil
+		}
+		cursor = next
+	}
+}
+
+// ListPage returns one page of keys under prefix, plus the cursor to resume from.
+func (d *database) ListPage(ctx context.Context, prefix string, opts ListPageOptions) ([]*Item, string, error) {
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = listPageSize
 	}
 
-	var items []*Item
+	metas, next, err := d.storageDrive.List(ctx, prefix, storage.ListOptions{
+		Limit:  limit,
+		Cursor: opts.Cursor,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+
+	items := make([]*Item, 0, len(metas))
 	for _, m := range metas {
+		if m == nil {
+			continue
+		}
 		items = append(items, &Item{
 			Meta: Meta{
 				Key:     m.Key,
 				ETag:    m.ETag,
 				ModTime: m.ModTime,
+				Size:    m.Size,
 			},
 		})
 	}
-	return items, nil
+	return items, next, nil
 }
 
 func (d *database) Cache() *cache.Manager {
