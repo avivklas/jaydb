@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/avivklas/jaydb/pkg/cache"
@@ -46,6 +48,18 @@ type Options struct {
 	// namespace so the owner node can pick the matching local DB. Leave empty
 	// for a single embedded database.
 	Namespace string
+
+	// CacheTTL is the cache entry freshness window. 0 = cache package default.
+	CacheTTL time.Duration
+
+	// CacheMaxObjectSize refuses to cache objects above this size, in bytes.
+	// 0 = no cap.
+	CacheMaxObjectSize int64
+
+	// CacheBudget is the byte accountant for this database's cache. Share one
+	// across every db.Open in the process to give them a single memory
+	// ceiling. nil = unbounded, not shared.
+	CacheBudget *cache.Budget
 }
 
 // PutOptions specifies options for write operations.
@@ -106,6 +120,18 @@ type database struct {
 	cacheMgr     *cache.Manager
 	codec        encoding.Codec
 	storageDrive storage.Driver
+
+	// reconcileMu serializes the ownership purge, and reconciledGen records the
+	// ring generation it last ran for. Both are needed: the atomic makes the
+	// common "nothing changed" check free, the mutex keeps N concurrent
+	// requests arriving on one membership change from running N full purges.
+	reconcileMu   sync.Mutex
+	reconciledGen atomic.Uint64
+
+	// hookAfterSelectivePurge is a test seam, nil in production. It fires between
+	// a selective purge and the check for a ring that moved underneath it, which
+	// is the only way to drive that race deterministically from a test.
+	hookAfterSelectivePurge func()
 }
 
 // Open initializes and returns an embedded document database.
@@ -120,7 +146,11 @@ func Open(opts Options) (DB, error) {
 		opts.ShardingDepth = 2
 	}
 
-	cacheMgr := cache.NewManager(opts.Storage)
+	cacheMgr := cache.NewManagerWithConfig(opts.Storage, cache.Config{
+		TTL:           opts.CacheTTL,
+		MaxObjectSize: opts.CacheMaxObjectSize,
+		Budget:        opts.CacheBudget,
+	})
 
 	d := &database{
 		opts:         opts,
@@ -139,7 +169,93 @@ func Open(opts Options) (DB, error) {
 	return d, nil
 }
 
+// reconcileOwnership drops cached keys this node no longer owns, lazily, on the
+// first operation after a membership change.
+//
+// The ring routes each key to a single owner, so the owner's cache is the only
+// cache for that key - coherence comes from ownership, not from the TTL. The
+// hole is churn: when ownership moves away, the previous owner keeps its entry,
+// and if ownership later flaps back (routine on FARGATE_SPOT, where tasks get
+// reclaimed) it serves data that changed in the meantime. Purging on the
+// generation change makes that impossible without a background goroutine, and
+// without leaning on a short TTL as the only backstop.
+func (d *database) reconcileOwnership() {
+	if d.opts.Ring == nil || d.opts.ClusterNode == nil {
+		return
+	}
+
+	gen := d.opts.Ring.Generation()
+	if d.reconciledGen.Load() == gen {
+		return
+	}
+
+	d.reconcileMu.Lock()
+	defer d.reconcileMu.Unlock()
+
+	// Re-check: while we queued on the mutex another request may have already
+	// purged for this generation, and a purge per concurrent request would turn
+	// a single membership change into a stampede.
+	if d.reconciledGen.Load() == gen {
+		return
+	}
+
+	ring := d.opts.Ring
+	self := d.opts.ClusterNode.SelfQuicAddr()
+	last := d.reconciledGen.Load()
+
+	// A selective purge can only reason about ONE observed transition. Each
+	// AddNode/RemoveNode bumps the generation by exactly one, so if more than a
+	// single step has elapsed since the last reconcile, a key may have moved
+	// away to another node - been written there - and moved back, leaving this
+	// node the owner again at the moment we look. Such a key passes the
+	// owner==self test and its pre-move value survives, which is exactly the
+	// stale read the purge exists to prevent. When generations were skipped
+	// there is no way to tell those keys apart, so drop everything. (On the
+	// very first reconcile this can fire against an empty cache, which costs
+	// nothing - every path that admits an entry reconciles before doing so.)
+	skippedGenerations := gen > last+1
+	if skippedGenerations {
+		d.purgeEverything()
+	} else {
+		d.cacheMgr.PurgeIf(func(key string) bool {
+			owner := ring.GetNode(key)
+			// An empty owner means the ring has no members at all; dropping the
+			// whole cache on a transient empty ring would be gratuitous.
+			return owner != "" && owner != self
+		})
+
+		// The selective predicate above reads the ring LIVE, once per key, so a
+		// membership change landing mid-purge means those answers did not all
+		// come from the same generation. A key can move away, be written on its
+		// new owner, and move back before the predicate reaches it - it then
+		// reports self as owner and the pre-move value survives, which is the
+		// stale read this whole mechanism exists to prevent. Detect the moving
+		// ring and fall back to the one decision that is valid no matter which
+		// generation each answer came from. A full purge ignores the ring
+		// entirely, so it cannot be invalidated the same way and needs no retry.
+		if d.hookAfterSelectivePurge != nil {
+			d.hookAfterSelectivePurge()
+		}
+		if ring.Generation() != gen {
+			d.purgeEverything()
+		}
+	}
+
+	// Record the generation observed BEFORE the purge: if membership moved again
+	// while we were purging, the next operation must reconcile once more.
+	d.reconciledGen.Store(gen)
+}
+
+// purgeEverything drops the whole cache. Used when the ring cannot be trusted to
+// classify entries - either generations were skipped, or membership moved while a
+// selective purge was in flight.
+func (d *database) purgeEverything() {
+	d.cacheMgr.PurgeIf(func(string) bool { return true })
+}
+
 func (d *database) Get(ctx context.Context, key string, dest any) (*Meta, error) {
+	d.reconcileOwnership()
+
 	// Inter-query routing check
 	if d.opts.Ring != nil && d.opts.ClusterNode != nil {
 		targetNode := d.opts.Ring.GetNode(key)
@@ -195,6 +311,8 @@ func (d *database) Get(ctx context.Context, key string, dest any) (*Meta, error)
 }
 
 func (d *database) Put(ctx context.Context, key string, doc any, opts ...PutOption) (*Meta, error) {
+	d.reconcileOwnership()
+
 	var po PutOptions
 	for _, opt := range opts {
 		opt(&po)
@@ -249,6 +367,8 @@ func (d *database) Put(ctx context.Context, key string, doc any, opts ...PutOpti
 }
 
 func (d *database) Delete(ctx context.Context, key string, opts ...DeleteOption) error {
+	d.reconcileOwnership()
+
 	var do DeleteOptions
 	for _, opt := range opts {
 		opt(&do)
@@ -278,15 +398,27 @@ func (d *database) Delete(ctx context.Context, key string, opts ...DeleteOption)
 	return d.cacheMgr.Delete(ctx, key, do.ExpectedETag)
 }
 
+// GetRaw, PutRaw and DeleteRaw are the owner-side entry points the cluster mesh
+// calls for a FORWARDED request, so they must reconcile ownership just like the
+// public methods do. Reconciling on the forwarding node is no help: the stale
+// entry lives in the cache of the node that receives the forward, and the
+// forwarded path is the only path that exists in a cluster - precisely where the
+// ownership purge has to work.
 func (d *database) GetRaw(ctx context.Context, key string) (*storage.Object, error) {
+	d.reconcileOwnership()
+
 	return d.cacheMgr.Get(ctx, key)
 }
 
 func (d *database) PutRaw(ctx context.Context, key string, value []byte, expectedETag string) (*storage.Object, error) {
+	d.reconcileOwnership()
+
 	return d.cacheMgr.Put(ctx, key, value, expectedETag)
 }
 
 func (d *database) DeleteRaw(ctx context.Context, key string, expectedETag string) error {
+	d.reconcileOwnership()
+
 	return d.cacheMgr.Delete(ctx, key, expectedETag)
 }
 

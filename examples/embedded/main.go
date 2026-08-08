@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/avivklas/jaydb/pkg/cache"
 	"github.com/avivklas/jaydb/pkg/db"
 	"github.com/avivklas/jaydb/pkg/metrics"
 	"github.com/avivklas/jaydb/pkg/storage/memory"
@@ -26,9 +27,14 @@ func main() {
 	fmt.Println("without running the HTTP server.\n")
 
 	// 1. Initialize in-memory database (pure embedded mode)
+	//    CacheBudget gives every database opened in this process one shared
+	//    memory ceiling; without it each cache grows independently.
+	cacheBudget := cache.NewBudget(64 * 1024 * 1024)
 	database, err := db.Open(db.Options{
-		Storage:       memory.NewDriver(),
-		ShardingDepth: 2,
+		Storage:            memory.NewDriver(),
+		ShardingDepth:      2,
+		CacheBudget:        cacheBudget,
+		CacheMaxObjectSize: 4 * 1024 * 1024,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -39,7 +45,7 @@ func main() {
 	collector := metrics.NewCollector(
 		database.Cache().Stats,
 		database.Cache().GetCacheSize,
-	)
+	).WithEvictionStats(database.Cache().EvictionStats).WithBudget(cacheBudget)
 	collector.Start()
 	defer collector.Stop()
 

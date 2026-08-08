@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // PartitionKey extracts the partition prefix from a hierarchical key given a depth.
@@ -29,11 +30,17 @@ type virtualNode struct {
 
 // Ring manages consistent hashing for cluster nodes.
 type Ring struct {
-	mu           sync.RWMutex
-	vnodes       []virtualNode
-	replicas     int // Virtual nodes per physical node
-	nodes        map[string]bool
+	mu             sync.RWMutex
+	vnodes         []virtualNode
+	replicas       int // Virtual nodes per physical node
+	nodes          map[string]bool
 	partitionDepth int
+
+	// generation increments on every real membership change so caches can
+	// detect that ownership moved. It is read on every DB operation, so it
+	// lives outside mu: taking the ring's RWMutex just to learn "nothing
+	// changed" would put a lock acquisition on the hot path.
+	generation atomic.Uint64
 }
 
 // NewRing initializes a consistent hash ring with configurable virtual nodes and partition depth.
@@ -73,6 +80,11 @@ func (r *Ring) AddNode(nodeAddr string) {
 	sort.Slice(r.vnodes, func(i, j int) bool {
 		return r.vnodes[i].hash < r.vnodes[j].hash
 	})
+
+	// Bumped only past the early return above: a re-add of a node already in
+	// the ring changes no ownership, and signalling one would cost every DB in
+	// the process a full cache purge for nothing.
+	r.generation.Add(1)
 }
 
 // RemoveNode unregisters a node from the hash ring.
@@ -92,6 +104,17 @@ func (r *Ring) RemoveNode(nodeAddr string) {
 		}
 	}
 	r.vnodes = newVNodes
+
+	// Same reasoning as AddNode: only a real removal moves ownership.
+	r.generation.Add(1)
+}
+
+// Generation returns a counter that increments on every membership change.
+// Callers cache ownership decisions (which node owns which key) and use this to
+// notice when those decisions went stale, so it is deliberately cheap enough to
+// read on every operation.
+func (r *Ring) Generation() uint64 {
+	return r.generation.Load()
 }
 
 // GetNode returns the physical node address responsible for the given key based on lexical partition depth.
