@@ -149,7 +149,7 @@ type NodeConfig struct {
 
 const (
 	defaultDialTimeout       = 3 * time.Second
-	defaultStreamOpenTimeout = 3 * time.Second
+	defaultStreamOpenTimeout = 500 * time.Millisecond
 	defaultRequestTimeout    = 10 * time.Second
 )
 

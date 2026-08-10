@@ -266,29 +266,33 @@ func (d *database) Get(ctx context.Context, key string, dest any) (*Meta, error)
 				Op:        cluster.OpGet,
 				Key:       key,
 			})
-			if err != nil {
-				return nil, fmt.Errorf("inter-query error: %w", err)
+			if err == nil && resp.Err == "" && resp.Object != nil {
+				if dest != nil {
+					if err := d.codec.Unmarshal(resp.Object.Value, dest); err != nil {
+						return nil, fmt.Errorf("db decode error: %w", err)
+					}
+				}
+				return &Meta{
+					Key:     resp.Object.Key,
+					ETag:    resp.Object.ETag,
+					ModTime: resp.Object.ModTime,
+				}, nil
 			}
-			if resp.Err != "" {
+			// Peer reported a definitive application-level error (e.g.
+			// ErrNotFound, ErrVersionMismatch): trust it and do not fall back.
+			if err == nil && resp.Err != "" {
 				return nil, mapErrorString(resp.Err)
 			}
-			// A genuinely absent document always arrives as resp.Err ==
-			// storage.ErrNotFound. So "no object and no error" means the peer
-			// could not answer - reporting that as ErrNotFound is what made a
-			// broken mesh look like data loss.
-			if resp.Object == nil {
-				return nil, fmt.Errorf("inter-query to %s: %w", targetNode, cluster.ErrIncompleteResponse)
+			// Transport failure or incomplete response: fall through to local
+			// storage. The document lives in the same S3 bucket regardless of
+			// which node reads it; the cluster routing is a cache optimization,
+			// not a correctness requirement for reads. Degrading to a local
+			// read adds one S3 round-trip but avoids multi-second stalls from
+			// unhealthy mesh connections.
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
 			}
-			if dest != nil {
-				if err := d.codec.Unmarshal(resp.Object.Value, dest); err != nil {
-					return nil, fmt.Errorf("db decode error: %w", err)
-				}
-			}
-			return &Meta{
-				Key:     resp.Object.Key,
-				ETag:    resp.Object.ETag,
-				ModTime: resp.Object.ModTime,
-			}, nil
+			// Fall through to local read below.
 		}
 	}
 
