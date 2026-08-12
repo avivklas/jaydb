@@ -61,7 +61,7 @@ func TestBudgetRefusesOversizedWithoutDraining(t *testing.T) {
 	}
 
 	// The object itself must not be cached, and must not be left half-accounted.
-	if _, ok := m1.items["huge"]; ok {
+	if m1.contains("huge") {
 		t.Error("an object larger than the entire budget was cached")
 	}
 }
@@ -85,7 +85,7 @@ func TestBudgetStillEvictsWhenObjectCanFit(t *testing.T) {
 		t.Fatalf("put d: %v", err)
 	}
 
-	if _, ok := mgr.items["d"]; !ok {
+	if !mgr.contains("d") {
 		t.Fatal("an object that fits the ceiling was refused")
 	}
 	if used, limit := budget.Used(), budget.Limit(); used > limit {
