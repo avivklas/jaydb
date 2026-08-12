@@ -397,14 +397,16 @@ func TestSingleflightFollowerHonoursContext(t *testing.T) {
 	}
 }
 
-// cachedKeys reports what the cache currently holds, most recently used first.
+// cachedKeys reports what the cache currently holds across shards.
 func cachedKeys(m *Manager) []string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	keys := make([]string, 0, len(m.items))
-	for el := m.lru.Front(); el != nil; el = el.Next() {
-		keys = append(keys, el.Value.(*Item).key)
+	var keys []string
+	for i := range m.shards {
+		shard := &m.shards[i]
+		shard.mu.RLock()
+		for el := shard.lru.Front(); el != nil; el = el.Next() {
+			keys = append(keys, el.Value.(*Item).key)
+		}
+		shard.mu.RUnlock()
 	}
 	return keys
 }
