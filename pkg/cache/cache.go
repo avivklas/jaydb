@@ -71,7 +71,6 @@ type Config struct {
 // even under hundreds of concurrent goroutines while adding negligible memory
 // overhead.
 const shardCount = 64
-const writeLockCount = 256
 
 // cacheShard holds a subset of cached items and their LRU list behind its own
 // mutex so concurrent reads and writes to different keys land on different
@@ -115,10 +114,6 @@ type Manager struct {
 	// Using sync.Map instead of a guarded map means registering a singleflight
 	// for key A does not block a singleflight for key B.
 	sfCalls sync.Map // map[string]*singleflightCall
-
-	// writeLocks stripes key-level write locks across a fixed array to eliminate
-	// dynamic lock allocation and prevent deletion races during concurrent writes.
-	writeLocks [writeLockCount]sync.Mutex
 
 	ttl           time.Duration
 	maxObjectSize int64
@@ -200,12 +195,6 @@ func (m *Manager) shardFor(key string) *cacheShard {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
 	return &m.shards[h.Sum32()&(shardCount-1)]
-}
-
-func (m *Manager) getKeyMutex(key string) *sync.Mutex {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(key))
-	return &m.writeLocks[h.Sum32()&(writeLockCount-1)]
 }
 
 func objectSize(obj *storage.Object) int64 {
@@ -369,12 +358,8 @@ func (m *Manager) EvictOldest() (freed int64, ok bool) {
 	return 0, false
 }
 
-// Put writes an object to cold storage under key-level mutex and populates the cache.
+// Put writes an object to cold storage and populates the cache.
 func (m *Manager) Put(ctx context.Context, key string, value []byte, expectedETag string) (*storage.Object, error) {
-	keyLock := m.getKeyMutex(key)
-	keyLock.Lock()
-	defer keyLock.Unlock()
-
 	obj, err := m.driver.Put(ctx, key, value, expectedETag)
 	if err != nil {
 		m.Invalidate(key)
@@ -387,10 +372,6 @@ func (m *Manager) Put(ctx context.Context, key string, value []byte, expectedETa
 
 // Delete removes an object from cold storage and invalidates the cache.
 func (m *Manager) Delete(ctx context.Context, key string, expectedETag string) error {
-	keyLock := m.getKeyMutex(key)
-	keyLock.Lock()
-	defer keyLock.Unlock()
-
 	err := m.driver.Delete(ctx, key, expectedETag)
 	m.Invalidate(key)
 	return err
