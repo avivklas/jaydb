@@ -11,14 +11,14 @@ import (
 	"github.com/avivklas/jaydb/pkg/storage"
 )
 
-// defaultTTL keeps cache entries fresh enough for multi-node consistency when
-// ownership churn is the only other coherence mechanism.
-const defaultTTL = 5 * time.Second
+// defaultTTL keeps cache entries fresh for up to 24 hours (1 day).
+const defaultTTL = 24 * time.Hour
 
-// Item represents a cached object along with fetch timestamp.
+// Item represents a cached object along with fetch and last accessed timestamps.
 type Item struct {
-	Object    *storage.Object
-	FetchedAt time.Time
+	Object       *storage.Object
+	FetchedAt    time.Time
+	LastAccessed time.Time
 
 	// key lets an eviction reach the map entry from the LRU list element it
 	// found, without a reverse scan.
@@ -31,14 +31,6 @@ type Item struct {
 	// would not match what was reserved and the budget would leak or
 	// over-release. Immutable for the lifetime of the entry.
 	size int64
-
-	// ref is the CLOCK reference bit, set by a cache hit and cleared by the
-	// eviction sweep. Recency is tracked with this bit rather than by moving
-	// the entry to the front of the list because reordering needs the write
-	// lock: doing that on every hit serialised all concurrent readers and cost
-	// ~50% of hit throughput at 4-8 goroutines. Atomic so the hit path can set
-	// it while holding only a read lock.
-	ref atomic.Bool
 }
 
 // singleflightCall holds state for an in-flight cold storage fetch.
@@ -209,20 +201,21 @@ func (m *Manager) Get(ctx context.Context, key string) (*storage.Object, error) 
 	ttl := m.ttl
 	shard := m.shardFor(key)
 
-	// 1. Cache lookup under shard read lock. A hit records recency by setting
-	// Item.ref atomically — no write lock needed.
-	shard.mu.RLock()
+	// 1. Cache lookup under shard lock. A hit updates LastAccessed and moves
+	// the element to the front of the LRU list.
+	shard.mu.Lock()
 	if el, found := shard.items[key]; found {
 		item := el.Value.(*Item)
-		if ttl > 0 && time.Since(item.FetchedAt) < ttl {
+		if ttl <= 0 || time.Since(item.FetchedAt) < ttl {
 			obj := item.Object
-			item.ref.Store(true)
-			shard.mu.RUnlock()
+			item.LastAccessed = time.Now()
+			shard.lru.MoveToFront(el)
+			shard.mu.Unlock()
 			atomic.AddUint64(&m.hits, 1)
 			return obj, nil
 		}
 	}
-	shard.mu.RUnlock()
+	shard.mu.Unlock()
 
 	atomic.AddUint64(&m.misses, 1)
 
@@ -276,6 +269,7 @@ func (m *Manager) admit(key string, obj *storage.Object) {
 		return
 	}
 
+	now := time.Now()
 	shard := m.shardFor(key)
 	shard.mu.Lock()
 	var replaced int64
@@ -283,12 +277,19 @@ func (m *Manager) admit(key string, obj *storage.Object) {
 		item := el.Value.(*Item)
 		replaced = item.size
 		item.Object = obj
-		item.FetchedAt = time.Now()
+		item.FetchedAt = now
+		item.LastAccessed = now
 		item.size = size
 		shard.lru.MoveToFront(el)
 		shard.bytes += size - replaced
 	} else {
-		shard.items[key] = shard.lru.PushFront(&Item{Object: obj, FetchedAt: time.Now(), key: key, size: size})
+		shard.items[key] = shard.lru.PushFront(&Item{
+			Object:       obj,
+			FetchedAt:    now,
+			LastAccessed: now,
+			key:          key,
+			size:         size,
+		})
 		shard.bytes += size
 	}
 	if shard.bytes < 0 {
@@ -301,60 +302,44 @@ func (m *Manager) admit(key string, obj *storage.Object) {
 	}
 }
 
-// EvictOldest implements Evictor across shards using CLOCK (second chance) and recency.
+// EvictOldest implements Evictor across shards using LRU eviction based on LastAccessed.
 func (m *Manager) EvictOldest() (freed int64, ok bool) {
-	var (
-		bestShard       *cacheShard
-		bestElem        *list.Element
-		oldestTime      time.Time
-		bestUnrefShard  *cacheShard
-		bestUnrefElem   *list.Element
-		oldestUnrefTime time.Time
-	)
+	for attempt := 0; attempt < 3; attempt++ {
+		var (
+			bestShard  *cacheShard
+			bestElem   *list.Element
+			oldestTime time.Time
+		)
 
-	for i := range m.shards {
-		shard := &m.shards[i]
-		shard.mu.RLock()
-		if el := shard.lru.Back(); el != nil {
-			item := el.Value.(*Item)
-			if oldestTime.IsZero() || item.FetchedAt.Before(oldestTime) {
-				oldestTime = item.FetchedAt
-				bestShard = shard
-				bestElem = el
-			}
-			if !item.ref.Load() {
-				if oldestUnrefTime.IsZero() || item.FetchedAt.Before(oldestUnrefTime) {
-					oldestUnrefTime = item.FetchedAt
-					bestUnrefShard = shard
-					bestUnrefElem = el
+		for i := range m.shards {
+			shard := &m.shards[i]
+			shard.mu.RLock()
+			if el := shard.lru.Back(); el != nil {
+				item := el.Value.(*Item)
+				if oldestTime.IsZero() || item.LastAccessed.Before(oldestTime) {
+					oldestTime = item.LastAccessed
+					bestShard = shard
+					bestElem = el
 				}
 			}
+			shard.mu.RUnlock()
 		}
-		shard.mu.RUnlock()
+
+		if bestShard == nil || bestElem == nil {
+			return 0, false
+		}
+
+		bestShard.mu.Lock()
+		item := bestElem.Value.(*Item)
+		if el, found := bestShard.items[item.key]; found && el == bestElem {
+			freed = bestShard.removeElemLocked(bestElem)
+			bestShard.mu.Unlock()
+			atomic.AddUint64(&m.evictions, 1)
+			return freed, true
+		}
+		bestShard.mu.Unlock()
 	}
 
-	targetShard := bestUnrefShard
-	targetElem := bestUnrefElem
-	if targetShard == nil {
-		targetShard = bestShard
-		targetElem = bestElem
-	}
-
-	if targetShard == nil || targetElem == nil {
-		return 0, false
-	}
-
-	targetShard.mu.Lock()
-	item := targetElem.Value.(*Item)
-	if el, found := targetShard.items[item.key]; found && el == targetElem {
-		freed = targetShard.removeElemLocked(targetElem)
-		targetShard.mu.Unlock()
-		atomic.AddUint64(&m.evictions, 1)
-		return freed, true
-	}
-	targetShard.mu.Unlock()
-
-	// If a race occurred, retry candidate selection
 	return 0, false
 }
 

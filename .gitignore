@@ -13,3 +13,4 @@ jaydb_data/
 *.tmp
 *.log
 .DS_Store
+.kiro/
