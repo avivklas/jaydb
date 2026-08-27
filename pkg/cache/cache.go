@@ -71,6 +71,7 @@ type Config struct {
 // even under hundreds of concurrent goroutines while adding negligible memory
 // overhead.
 const shardCount = 64
+const writeLockCount = 256
 
 // cacheShard holds a subset of cached items and their LRU list behind its own
 // mutex so concurrent reads and writes to different keys land on different
@@ -115,7 +116,9 @@ type Manager struct {
 	// for key A does not block a singleflight for key B.
 	sfCalls sync.Map // map[string]*singleflightCall
 
-	keyLocks sync.Map // map[string]*sync.Mutex
+	// writeLocks stripes key-level write locks across a fixed array to eliminate
+	// dynamic lock allocation and prevent deletion races during concurrent writes.
+	writeLocks [writeLockCount]sync.Mutex
 
 	ttl           time.Duration
 	maxObjectSize int64
@@ -200,8 +203,9 @@ func (m *Manager) shardFor(key string) *cacheShard {
 }
 
 func (m *Manager) getKeyMutex(key string) *sync.Mutex {
-	actual, _ := m.keyLocks.LoadOrStore(key, &sync.Mutex{})
-	return actual.(*sync.Mutex)
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return &m.writeLocks[h.Sum32()&(writeLockCount-1)]
 }
 
 func objectSize(obj *storage.Object) int64 {
@@ -369,10 +373,7 @@ func (m *Manager) EvictOldest() (freed int64, ok bool) {
 func (m *Manager) Put(ctx context.Context, key string, value []byte, expectedETag string) (*storage.Object, error) {
 	keyLock := m.getKeyMutex(key)
 	keyLock.Lock()
-	defer func() {
-		keyLock.Unlock()
-		m.keyLocks.Delete(key) // allow GC; next write will re-create
-	}()
+	defer keyLock.Unlock()
 
 	obj, err := m.driver.Put(ctx, key, value, expectedETag)
 	if err != nil {
@@ -388,10 +389,7 @@ func (m *Manager) Put(ctx context.Context, key string, value []byte, expectedETa
 func (m *Manager) Delete(ctx context.Context, key string, expectedETag string) error {
 	keyLock := m.getKeyMutex(key)
 	keyLock.Lock()
-	defer func() {
-		keyLock.Unlock()
-		m.keyLocks.Delete(key) // allow GC; next write will re-create
-	}()
+	defer keyLock.Unlock()
 
 	err := m.driver.Delete(ctx, key, expectedETag)
 	m.Invalidate(key)

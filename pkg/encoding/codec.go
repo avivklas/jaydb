@@ -27,6 +27,9 @@ func (j *JSONCodec) Marshal(v any) ([]byte, error) {
 	if b, ok := v.([]byte); ok {
 		return b, nil
 	}
+	if rm, ok := v.(json.RawMessage); ok {
+		return rm, nil
+	}
 	if s, ok := v.(string); ok {
 		return []byte(s), nil
 	}
@@ -35,6 +38,10 @@ func (j *JSONCodec) Marshal(v any) ([]byte, error) {
 
 func (j *JSONCodec) Unmarshal(data []byte, v any) error {
 	if dest, ok := v.(*[]byte); ok {
+		*dest = append([]byte(nil), data...)
+		return nil
+	}
+	if dest, ok := v.(*json.RawMessage); ok {
 		*dest = append([]byte(nil), data...)
 		return nil
 	}
@@ -60,10 +67,12 @@ func (r *RawCodec) Marshal(v any) ([]byte, error) {
 	switch val := v.(type) {
 	case []byte:
 		return val, nil
+	case json.RawMessage:
+		return val, nil
 	case string:
 		return []byte(val), nil
 	default:
-		return nil, fmt.Errorf("raw codec requires []byte or string, got %T", v)
+		return nil, fmt.Errorf("raw codec requires []byte, json.RawMessage, or string, got %T", v)
 	}
 }
 
@@ -72,10 +81,13 @@ func (r *RawCodec) Unmarshal(data []byte, v any) error {
 	case *[]byte:
 		*dest = append([]byte(nil), data...)
 		return nil
+	case *json.RawMessage:
+		*dest = append([]byte(nil), data...)
+		return nil
 	case *string:
 		*dest = string(data)
 		return nil
 	default:
-		return fmt.Errorf("raw codec requires *[]byte or *string, got %T", v)
+		return fmt.Errorf("raw codec requires *[]byte, *json.RawMessage, or *string, got %T", v)
 	}
 }
