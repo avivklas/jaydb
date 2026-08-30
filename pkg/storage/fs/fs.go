@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/trace"
 	"sort"
 	"strings"
 	"sync"
@@ -41,6 +42,7 @@ func (d *Driver) generateETag(data []byte, modTime time.Time) string {
 }
 
 func (d *Driver) Get(ctx context.Context, key string) (*storage.Object, error) {
+	defer trace.StartRegion(ctx, "fs.get").End()
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -69,6 +71,7 @@ func (d *Driver) Get(ctx context.Context, key string) (*storage.Object, error) {
 }
 
 func (d *Driver) Put(ctx context.Context, key string, value []byte, expectedETag string) (*storage.Object, error) {
+	defer trace.StartRegion(ctx, "fs.put").End()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -126,6 +129,7 @@ func (d *Driver) Put(ctx context.Context, key string, value []byte, expectedETag
 }
 
 func (d *Driver) Delete(ctx context.Context, key string, expectedETag string) error {
+	defer trace.StartRegion(ctx, "fs.delete").End()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -157,6 +161,7 @@ func (d *Driver) Delete(ctx context.Context, key string, expectedETag string) er
 }
 
 func (d *Driver) List(ctx context.Context, prefix string, opts storage.ListOptions) ([]*storage.KeyMeta, string, error) {
+	defer trace.StartRegion(ctx, "fs.list").End()
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 

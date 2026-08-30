@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime/trace"
 	"strings"
 	"time"
 
@@ -23,13 +24,14 @@ import (
 
 // Config defines connection details for an S3 / S3-compatible bucket endpoint.
 type Config struct {
-	Endpoint   string // e.g. "https://s3.amazonaws.com" or "http://localhost:9000"
-	Bucket     string
-	Region     string
-	AccessKey  string
-	SecretKey  string
-	Prefix     string
-	HTTPClient *http.Client
+	Endpoint     string // e.g. "https://s3.amazonaws.com" or "http://localhost:9000"
+	Bucket       string
+	Region       string
+	AccessKey    string
+	SecretKey    string
+	SessionToken string
+	Prefix       string
+	HTTPClient   *http.Client
 }
 
 // Driver implements storage.Driver using official AWS SDK v2 for S3 with SigV4 and IAM role support.
@@ -61,8 +63,13 @@ func NewDriver(cfg Config) (storage.Driver, error) {
 		opts = append(opts, config.WithHTTPClient(cfg.HTTPClient))
 	}
 
+	sessionToken := cfg.SessionToken
+	if sessionToken == "" {
+		sessionToken = os.Getenv("AWS_SESSION_TOKEN")
+	}
+
 	if cfg.AccessKey != "" && cfg.SecretKey != "" {
-		opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")))
+		opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, sessionToken)))
 	} else if cfg.Endpoint != "" || cfg.HTTPClient != nil {
 		opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy-key", "dummy-secret", "")))
 	}
@@ -98,6 +105,7 @@ func (d *Driver) resolveKey(key string) string {
 }
 
 func (d *Driver) Get(ctx context.Context, key string) (*storage.Object, error) {
+	defer trace.StartRegion(ctx, "s3.get").End()
 	s3Key := d.resolveKey(key)
 	out, err := d.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(d.bucket),
@@ -117,7 +125,9 @@ func (d *Driver) Get(ctx context.Context, key string) (*storage.Object, error) {
 	}
 	defer out.Body.Close()
 
+	bodyRegion := trace.StartRegion(ctx, "s3.read_body")
 	data, err := io.ReadAll(out.Body)
+	bodyRegion.End()
 	if err != nil {
 		return nil, fmt.Errorf("s3 read body failed: %w", err)
 	}
@@ -142,6 +152,7 @@ func (d *Driver) Get(ctx context.Context, key string) (*storage.Object, error) {
 }
 
 func (d *Driver) Put(ctx context.Context, key string, value []byte, expectedETag string) (*storage.Object, error) {
+	defer trace.StartRegion(ctx, "s3.put").End()
 	s3Key := d.resolveKey(key)
 	input := &s3.PutObjectInput{
 		Bucket: aws.String(d.bucket),
@@ -183,6 +194,7 @@ func (d *Driver) Put(ctx context.Context, key string, value []byte, expectedETag
 }
 
 func (d *Driver) Delete(ctx context.Context, key string, expectedETag string) error {
+	defer trace.StartRegion(ctx, "s3.delete").End()
 	s3Key := d.resolveKey(key)
 	_, err := d.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(d.bucket),
@@ -195,6 +207,7 @@ func (d *Driver) Delete(ctx context.Context, key string, expectedETag string) er
 }
 
 func (d *Driver) List(ctx context.Context, prefix string, opts storage.ListOptions) ([]*storage.KeyMeta, string, error) {
+	defer trace.StartRegion(ctx, "s3.list").End()
 	s3Prefix := d.resolveKey(prefix)
 	input := &s3.ListObjectsV2Input{
 		Bucket: aws.String(d.bucket),

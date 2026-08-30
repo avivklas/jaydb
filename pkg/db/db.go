@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime/trace"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -189,6 +190,8 @@ func (d *database) reconcileOwnership() {
 		return
 	}
 
+	defer trace.StartRegion(context.Background(), "db.reconcile_ownership").End()
+
 	d.reconcileMu.Lock()
 	defer d.reconcileMu.Unlock()
 
@@ -254,6 +257,7 @@ func (d *database) purgeEverything() {
 }
 
 func (d *database) Get(ctx context.Context, key string, dest any) (*Meta, error) {
+	defer trace.StartRegion(ctx, "db.get").End()
 	d.reconcileOwnership()
 
 	// Inter-query routing check
@@ -261,14 +265,19 @@ func (d *database) Get(ctx context.Context, key string, dest any) (*Meta, error)
 		targetNode := d.opts.Ring.GetNode(key)
 		selfAddr := d.opts.ClusterNode.SelfQuicAddr()
 		if targetNode != "" && targetNode != selfAddr {
+			iqReg := trace.StartRegion(ctx, "db.interquery_get")
 			resp, err := d.opts.ClusterNode.ExecuteInterQuery(ctx, targetNode, cluster.InterQueryReq{
 				Namespace: d.opts.Namespace,
 				Op:        cluster.OpGet,
 				Key:       key,
 			})
+			iqReg.End()
 			if err == nil && resp.Err == "" && resp.Object != nil {
 				if dest != nil {
-					if err := d.codec.Unmarshal(resp.Object.Value, dest); err != nil {
+					decReg := trace.StartRegion(ctx, "db.unmarshal")
+					err := d.codec.Unmarshal(resp.Object.Value, dest)
+					decReg.End()
+					if err != nil {
 						return nil, fmt.Errorf("db decode error: %w", err)
 					}
 				}
@@ -302,7 +311,10 @@ func (d *database) Get(ctx context.Context, key string, dest any) (*Meta, error)
 	}
 
 	if dest != nil {
-		if err := d.codec.Unmarshal(obj.Value, dest); err != nil {
+		decReg := trace.StartRegion(ctx, "db.unmarshal")
+		err := d.codec.Unmarshal(obj.Value, dest)
+		decReg.End()
+		if err != nil {
 			return nil, fmt.Errorf("db decode error: %w", err)
 		}
 	}
@@ -315,6 +327,7 @@ func (d *database) Get(ctx context.Context, key string, dest any) (*Meta, error)
 }
 
 func (d *database) Put(ctx context.Context, key string, doc any, opts ...PutOption) (*Meta, error) {
+	defer trace.StartRegion(ctx, "db.put").End()
 	d.reconcileOwnership()
 
 	var po PutOptions
@@ -322,7 +335,9 @@ func (d *database) Put(ctx context.Context, key string, doc any, opts ...PutOpti
 		opt(&po)
 	}
 
+	encReg := trace.StartRegion(ctx, "db.marshal")
 	data, err := d.codec.Marshal(doc)
+	encReg.End()
 	if err != nil {
 		return nil, fmt.Errorf("db encode error: %w", err)
 	}
@@ -332,6 +347,7 @@ func (d *database) Put(ctx context.Context, key string, doc any, opts ...PutOpti
 		targetNode := d.opts.Ring.GetNode(key)
 		selfAddr := d.opts.ClusterNode.SelfQuicAddr()
 		if targetNode != "" && targetNode != selfAddr {
+			iqReg := trace.StartRegion(ctx, "db.interquery_put")
 			resp, err := d.opts.ClusterNode.ExecuteInterQuery(ctx, targetNode, cluster.InterQueryReq{
 				Namespace:    d.opts.Namespace,
 				Op:           cluster.OpPut,
@@ -339,6 +355,7 @@ func (d *database) Put(ctx context.Context, key string, doc any, opts ...PutOpti
 				Value:        data,
 				ExpectedETag: po.ExpectedETag,
 			})
+			iqReg.End()
 			if err != nil {
 				return nil, fmt.Errorf("inter-query error: %w", err)
 			}
@@ -371,6 +388,7 @@ func (d *database) Put(ctx context.Context, key string, doc any, opts ...PutOpti
 }
 
 func (d *database) Delete(ctx context.Context, key string, opts ...DeleteOption) error {
+	defer trace.StartRegion(ctx, "db.delete").End()
 	d.reconcileOwnership()
 
 	var do DeleteOptions
@@ -383,12 +401,14 @@ func (d *database) Delete(ctx context.Context, key string, opts ...DeleteOption)
 		targetNode := d.opts.Ring.GetNode(key)
 		selfAddr := d.opts.ClusterNode.SelfQuicAddr()
 		if targetNode != "" && targetNode != selfAddr {
+			iqReg := trace.StartRegion(ctx, "db.interquery_delete")
 			resp, err := d.opts.ClusterNode.ExecuteInterQuery(ctx, targetNode, cluster.InterQueryReq{
 				Namespace:    d.opts.Namespace,
 				Op:           cluster.OpDelete,
 				Key:          key,
 				ExpectedETag: do.ExpectedETag,
 			})
+			iqReg.End()
 			if err != nil {
 				return fmt.Errorf("inter-query error: %w", err)
 			}
@@ -409,18 +429,21 @@ func (d *database) Delete(ctx context.Context, key string, opts ...DeleteOption)
 // forwarded path is the only path that exists in a cluster - precisely where the
 // ownership purge has to work.
 func (d *database) GetRaw(ctx context.Context, key string) (*storage.Object, error) {
+	defer trace.StartRegion(ctx, "db.get_raw").End()
 	d.reconcileOwnership()
 
 	return d.cacheMgr.Get(ctx, key)
 }
 
 func (d *database) PutRaw(ctx context.Context, key string, value []byte, expectedETag string) (*storage.Object, error) {
+	defer trace.StartRegion(ctx, "db.put_raw").End()
 	d.reconcileOwnership()
 
 	return d.cacheMgr.Put(ctx, key, value, expectedETag)
 }
 
 func (d *database) DeleteRaw(ctx context.Context, key string, expectedETag string) error {
+	defer trace.StartRegion(ctx, "db.delete_raw").End()
 	d.reconcileOwnership()
 
 	return d.cacheMgr.Delete(ctx, key, expectedETag)
@@ -454,6 +477,7 @@ type ListPageOptions struct {
 // A limit of zero or less means "every matching key", which is unbounded by
 // definition - prefer ListPage when the keyspace may be large.
 func (d *database) List(ctx context.Context, prefix string, limit int) ([]*Item, error) {
+	defer trace.StartRegion(ctx, "db.list").End()
 	var (
 		items  []*Item
 		cursor string
@@ -490,6 +514,7 @@ func (d *database) List(ctx context.Context, prefix string, limit int) ([]*Item,
 
 // ListPage returns one page of keys under prefix, plus the cursor to resume from.
 func (d *database) ListPage(ctx context.Context, prefix string, opts ListPageOptions) ([]*Item, string, error) {
+	defer trace.StartRegion(ctx, "db.list_page").End()
 	limit := opts.Limit
 	if limit <= 0 {
 		limit = listPageSize
