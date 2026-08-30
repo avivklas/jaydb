@@ -167,4 +167,3 @@ func TestMeshPoolLifecycleOnNodeDeparture(t *testing.T) {
 		t.Errorf("ring still has departed node %s", targetQuic)
 	}
 }
-

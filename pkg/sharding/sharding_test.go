@@ -146,4 +146,3 @@ func TestSetNodes(t *testing.T) {
 		t.Fatalf("expected 2 nodes, got %d", ring.NodeCount())
 	}
 }
-

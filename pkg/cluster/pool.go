@@ -330,11 +330,11 @@ func NewMeshPool(parentCtx context.Context, poolSize int, tlsConfig *tls.Config,
 
 	ctx, cancel := context.WithCancel(parentCtx)
 	return &MeshPool{
-		peers:      make(map[string]*PeerPool),
-		poolSize:   poolSize,
-		tlsConfig:  tlsConfig,
-		dialTo:     dialTo,
-		streamTo:   streamTo,
+		peers:     make(map[string]*PeerPool),
+		poolSize:  poolSize,
+		tlsConfig: tlsConfig,
+		dialTo:    dialTo,
+		streamTo:  streamTo,
 		quicConfig: &quic.Config{
 			MaxIdleTimeout:  30 * time.Second,
 			KeepAlivePeriod: 10 * time.Second,
