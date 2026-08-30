@@ -105,6 +105,15 @@ type Handler interface {
 	DeleteRaw(ctx context.Context, key string, expectedETag string) error
 }
 
+// MemberInfo provides a snapshot of a cluster node discovered via memberlist.
+type MemberInfo struct {
+	Name       string `json:"name"`
+	Addr       string `json:"addr"`
+	GossipPort int    `json:"gossip_port"`
+	QuicPort   int    `json:"quic_port"`
+	QuicAddr   string `json:"quic_addr"`
+}
+
 // NodeConfig specifies memberlist and QUIC mesh parameters.
 //
 // BindPort and QuicPort may each be 0 to request an OS-assigned ephemeral port.
@@ -119,6 +128,10 @@ type NodeConfig struct {
 	QuicPort  int
 	JoinAddrs []string
 	Ring      *sharding.Ring
+
+	// PoolSize specifies the number of pre-opened QUIC connections to maintain per peer.
+	// Defaults to 2 if <= 0.
+	PoolSize int
 
 	// DBHandler is the legacy single-database handler, used only for requests
 	// that carry no namespace. Multi-namespace deployments call
@@ -180,8 +193,7 @@ type Node struct {
 	mlist     *memberlist.Memberlist
 	quicLn    *quic.Listener
 	ring      *sharding.Ring
-	mu        sync.RWMutex
-	conns     map[string]*quic.Conn
+	meshPool  *MeshPool
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup // Tracks background goroutines for graceful shutdown
@@ -198,13 +210,6 @@ type Node struct {
 	// so the owner node must be told which one a request refers to.
 	handlersMu sync.RWMutex
 	handlers   map[string]Handler
-
-	// dialLocks serializes concurrent dials to the SAME peer without blocking
-	// dials to other peers or lookups of existing connections. Dialing while
-	// holding the node-wide mutex made one unreachable peer stall every
-	// inter-query in the process.
-	dialLocksMu sync.Mutex
-	dialLocks   map[string]*sync.Mutex
 }
 
 // RegisterHandler registers the local DB that serves namespace. Safe to call
@@ -252,40 +257,45 @@ func (n *Node) handlerFor(namespace string) (Handler, bool) {
 	return nil, false
 }
 
-// dialLockFor returns the per-peer dial mutex, creating it on first use.
-func (n *Node) dialLockFor(target string) *sync.Mutex {
-	n.dialLocksMu.Lock()
-	defer n.dialLocksMu.Unlock()
-	if n.dialLocks == nil {
-		n.dialLocks = make(map[string]*sync.Mutex)
-	}
-	mu, ok := n.dialLocks[target]
-	if !ok {
-		mu = &sync.Mutex{}
-		n.dialLocks[target] = mu
-	}
-	return mu
-}
-
 type eventDelegate struct {
 	node *Node
 }
 
 func (ed *eventDelegate) NotifyJoin(n *memberlist.Node) {
-	if ed.node != nil && ed.node.ring != nil {
+	if ed.node != nil {
 		quicAddr := fmt.Sprintf("%s:%d", n.Addr.String(), getQuicPort(n))
-		ed.node.ring.AddNode(quicAddr)
+		if ed.node.ring != nil {
+			ed.node.ring.AddNode(quicAddr)
+		}
+		if ed.node.meshPool != nil && quicAddr != ed.node.SelfQuicAddr() {
+			ed.node.meshPool.AddPeer(quicAddr)
+		}
 	}
 }
 
 func (ed *eventDelegate) NotifyLeave(n *memberlist.Node) {
-	if ed.node != nil && ed.node.ring != nil {
+	if ed.node != nil {
 		quicAddr := fmt.Sprintf("%s:%d", n.Addr.String(), getQuicPort(n))
-		ed.node.ring.RemoveNode(quicAddr)
+		if ed.node.ring != nil {
+			ed.node.ring.RemoveNode(quicAddr)
+		}
+		if ed.node.meshPool != nil {
+			ed.node.meshPool.RemovePeer(quicAddr)
+		}
 	}
 }
 
-func (ed *eventDelegate) NotifyUpdate(n *memberlist.Node) {}
+func (ed *eventDelegate) NotifyUpdate(n *memberlist.Node) {
+	if ed.node != nil {
+		quicAddr := fmt.Sprintf("%s:%d", n.Addr.String(), getQuicPort(n))
+		if ed.node.ring != nil {
+			ed.node.ring.AddNode(quicAddr)
+		}
+		if ed.node.meshPool != nil && quicAddr != ed.node.SelfQuicAddr() {
+			ed.node.meshPool.AddPeer(quicAddr)
+		}
+	}
+}
 
 func getQuicPort(n *memberlist.Node) int {
 	if len(n.Meta) >= 2 {
@@ -298,23 +308,28 @@ func getQuicPort(n *memberlist.Node) int {
 func NewNode(cfg NodeConfig) (*Node, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	ring := cfg.Ring
+	if ring == nil {
+		ring = sharding.NewRing(1, 2)
+	}
+
 	n := &Node{
-		cfg:    cfg,
-		ring:   cfg.Ring,
-		conns:  make(map[string]*quic.Conn),
-		ctx:    ctx,
-		cancel: cancel,
+		cfg:      cfg,
+		ring:     ring,
+		ctx:      ctx,
+		cancel:   cancel,
+		handlers: make(map[string]Handler),
 	}
 
 	// 1. Setup QUIC Listener
-	tlsConf, err := generateTLSConfig()
+	serverTLSConf, err := generateTLSConfig()
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("quic tls config error: %w", err)
 	}
 
 	quicAddr := fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.QuicPort)
-	quicLn, err := quic.ListenAddr(quicAddr, tlsConf, &quic.Config{
+	quicLn, err := quic.ListenAddr(quicAddr, serverTLSConf, &quic.Config{
 		MaxIdleTimeout:  30 * time.Second,
 		KeepAlivePeriod: 10 * time.Second,
 	})
@@ -333,8 +348,20 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		return nil, fmt.Errorf("quic listen: resolve bound port: %w", err)
 	}
 
+	// Setup Client TLS Config for outbound mesh pool dials
+	clientTLSConf := &tls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // authenticated at request layer
+		NextProtos:         []string{"jaydb-quic"},
+		MinVersion:         tls.VersionTLS13,
+	}
+
+	n.meshPool = NewMeshPool(ctx, cfg.PoolSize, clientTLSConf, cfg.dialTimeout(), cfg.streamOpenTimeout(), n)
+
 	n.wg.Add(1) // Track acceptLoop goroutine
 	go n.acceptLoop()
+
+	// Register self in ring
+	n.ring.AddNode(n.SelfQuicAddr())
 
 	// 2. Setup Memberlist
 	mlConfig := memberlist.DefaultLANConfig()
@@ -352,19 +379,24 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	mlist, err := memberlist.Create(mlConfig)
 	if err != nil {
 		_ = quicLn.Close()
+		n.meshPool.Close()
 		cancel()
 		return nil, fmt.Errorf("memberlist create error: %w", err)
 	}
 	n.mlist = mlist
 	n.bindPort = int(mlist.LocalNode().Port)
 
-	// Register self in ring
-	if n.ring != nil {
-		n.ring.AddNode(n.SelfQuicAddr())
-	}
-
 	if len(cfg.JoinAddrs) > 0 {
 		_, _ = mlist.Join(cfg.JoinAddrs)
+	}
+
+	// Sync initial memberlist members into ring and mesh connection pool
+	for _, member := range mlist.Members() {
+		mQuicAddr := fmt.Sprintf("%s:%d", member.Addr.String(), getQuicPort(member))
+		n.ring.AddNode(mQuicAddr)
+		if mQuicAddr != n.SelfQuicAddr() {
+			n.meshPool.AddPeer(mQuicAddr)
+		}
 	}
 
 	return n, nil
@@ -542,98 +574,7 @@ func (n *Node) authenticate(req InterQueryReq) error {
 	return nil
 }
 
-// getConn returns a connection to targetNode, dialing if necessary.
-//
-// The dial happens under a PER-PEER lock and is bounded by both the caller's
-// context and DialTimeout. Previously it ran while holding the node-wide mutex
-// on the node's lifetime context, so a single unreachable peer serialized every
-// inter-query in the process for up to MaxIdleTimeout (30s).
-func (n *Node) getConn(ctx context.Context, targetNode string) (*quic.Conn, error) {
-	if conn, ok := n.cachedConn(targetNode); ok {
-		return conn, nil
-	}
-
-	dialMu := n.dialLockFor(targetNode)
-	dialMu.Lock()
-	defer dialMu.Unlock()
-
-	// Another goroutine may have dialed this peer while we waited.
-	if conn, ok := n.cachedConn(targetNode); ok {
-		return conn, nil
-	}
-
-	tlsConf := &tls.Config{
-		// Peer identity is established by the ClusterSecret HMAC on every
-		// request rather than by PKI; the certificate is ephemeral and
-		// self-signed, so verifying it would prove nothing. Set ClusterSecret
-		// in any deployment where the mesh port is reachable by anything you do
-		// not control.
-		InsecureSkipVerify: true, //nolint:gosec // authenticated at the request layer
-		NextProtos:         []string{"jaydb-quic"},
-		MinVersion:         tls.VersionTLS13,
-	}
-
-	// Bound by the caller's deadline AND the node's lifetime: a request that is
-	// abandoned must not leave a dial running, and shutdown must not wait on one.
-	dialCtx, cancel := context.WithTimeout(ctx, n.cfg.dialTimeout())
-	defer cancel()
-	stop := context.AfterFunc(n.ctx, cancel)
-	defer stop()
-
-	conn, err := quic.DialAddr(dialCtx, targetNode, tlsConf, &quic.Config{
-		MaxIdleTimeout:  30 * time.Second,
-		KeepAlivePeriod: 10 * time.Second,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("quic dial error to %s: %w", targetNode, err)
-	}
-
-	n.mu.Lock()
-	if existing, exists := n.conns[targetNode]; exists {
-		n.mu.Unlock()
-		_ = conn.CloseWithError(0, "duplicate connection")
-		return existing, nil
-	}
-	n.conns[targetNode] = conn
-	n.mu.Unlock()
-
-	return conn, nil
-}
-
-// cachedConn returns a live cached connection, discarding one whose peer has
-// gone away. Without the liveness check, OpenStreamSync on a dead connection
-// blocks until MaxIdleTimeout rather than failing fast.
-func (n *Node) cachedConn(targetNode string) (*quic.Conn, bool) {
-	n.mu.RLock()
-	conn, ok := n.conns[targetNode]
-	n.mu.RUnlock()
-	if !ok {
-		return nil, false
-	}
-
-	select {
-	case <-conn.Context().Done():
-		n.dropConn(targetNode, conn)
-		return nil, false
-	default:
-		return conn, true
-	}
-}
-
-// dropConn removes conn from the pool only if it is still the pooled entry, so
-// a concurrent redial is not discarded.
-func (n *Node) dropConn(targetNode string, conn *quic.Conn) {
-	n.mu.Lock()
-	if current, ok := n.conns[targetNode]; ok && current == conn {
-		delete(n.conns, targetNode)
-	}
-	n.mu.Unlock()
-	if conn != nil {
-		_ = conn.CloseWithError(0, "stale connection")
-	}
-}
-
-// ExecuteInterQuery routes an inter-query operation to targetNode over QUIC mesh.
+// ExecuteInterQuery routes an inter-query operation to targetNode over the pre-opened QUIC mesh pool.
 func (n *Node) ExecuteInterQuery(ctx context.Context, targetNode string, req InterQueryReq) (*InterQueryResp, error) {
 	if n.cfg.ClusterSecret != "" {
 		req.TS = time.Now().Unix()
@@ -644,8 +585,7 @@ func (n *Node) ExecuteInterQuery(ctx context.Context, targetNode string, req Int
 	if err == nil {
 		return resp, nil
 	}
-	// One retry: the cached connection may have died between the liveness check
-	// and the stream open.
+	// One retry: if connection dropped or stale, retry on another pooled connection if ctx not expired
 	if ctx.Err() != nil {
 		return nil, err
 	}
@@ -653,31 +593,28 @@ func (n *Node) ExecuteInterQuery(ctx context.Context, targetNode string, req Int
 }
 
 func (n *Node) roundTrip(ctx context.Context, targetNode string, req InterQueryReq) (*InterQueryResp, error) {
-	conn, err := n.getConn(ctx, targetNode)
-	if err != nil {
-		return nil, err
+	if n.meshPool == nil {
+		return nil, errors.New("jaydb cluster: mesh pool not initialized")
 	}
 
-	// Bound stream establishment separately from the dial: a connection can be
-	// cached and apparently healthy while its peer no longer responds.
-	openCtx, cancel := context.WithTimeout(ctx, n.cfg.streamOpenTimeout())
-	defer cancel()
-
-	stream, err := conn.OpenStreamSync(openCtx)
+	stream, dropFunc, err := n.meshPool.GetStream(ctx, targetNode)
 	if err != nil {
-		n.dropConn(targetNode, conn)
-		return nil, fmt.Errorf("quic open stream to %s: %w", targetNode, err)
+		return nil, err
 	}
 	defer stream.Close()
 
 	if err := json.NewEncoder(stream).Encode(&req); err != nil {
-		n.dropConn(targetNode, conn)
+		if dropFunc != nil {
+			dropFunc()
+		}
 		return nil, err
 	}
 
 	var resp InterQueryResp
 	if err := json.NewDecoder(stream).Decode(&resp); err != nil {
-		n.dropConn(targetNode, conn)
+		if dropFunc != nil {
+			dropFunc()
+		}
 		return nil, err
 	}
 
@@ -708,6 +645,55 @@ func (n *Node) GossipAddr() string {
 	return fmt.Sprintf("%s:%d", n.cfg.BindAddr, n.bindPort)
 }
 
+// Members returns the list of active cluster members discovered via memberlist.
+func (n *Node) Members() []MemberInfo {
+	if n.mlist == nil {
+		return nil
+	}
+	mlMembers := n.mlist.Members()
+	members := make([]MemberInfo, len(mlMembers))
+	for i, m := range mlMembers {
+		qPort := getQuicPort(m)
+		members[i] = MemberInfo{
+			Name:       m.Name,
+			Addr:       m.Addr.String(),
+			GossipPort: int(m.Port),
+			QuicPort:   qPort,
+			QuicAddr:   fmt.Sprintf("%s:%d", m.Addr.String(), qPort),
+		}
+	}
+	return members
+}
+
+// MemberCount returns the total number of members currently in the cluster.
+func (n *Node) MemberCount() int {
+	if n.mlist == nil {
+		if n.ring != nil {
+			return n.ring.NodeCount()
+		}
+		return 0
+	}
+	return n.mlist.NumMembers()
+}
+
+// Ring returns the deterministic sharding ring associated with this node.
+func (n *Node) Ring() *sharding.Ring {
+	return n.ring
+}
+
+// IsOwner returns whether this node is the designated shard owner for the given key.
+func (n *Node) IsOwner(key string) bool {
+	if n.ring == nil {
+		return true
+	}
+	return n.ring.IsOwner(key, n.SelfQuicAddr())
+}
+
+// MeshPool returns the underlying MeshPool.
+func (n *Node) MeshPool() *MeshPool {
+	return n.meshPool
+}
+
 // Close gracefully terminates node connection pool and memberlist.
 //
 // Close is idempotent and safe to call concurrently: memberlist panics if Leave
@@ -730,12 +716,10 @@ func (n *Node) Close() error {
 			_ = n.quicLn.Close()
 		}
 
-		// Close all existing connections
-		n.mu.Lock()
-		for _, conn := range n.conns {
-			_ = conn.CloseWithError(0, "node closing")
+		// Close proactive mesh connection pool
+		if n.meshPool != nil {
+			n.meshPool.Close()
 		}
-		n.mu.Unlock()
 
 		// Wait for all background goroutines to finish (acceptLoop and handleConn goroutines)
 		n.wg.Wait()
