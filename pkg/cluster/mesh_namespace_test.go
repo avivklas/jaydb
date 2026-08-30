@@ -248,7 +248,7 @@ func TestDialIsBoundedAndConcurrent(t *testing.T) {
 	done := make(chan error, peers)
 	for i := 0; i < peers; i++ {
 		go func(i int) {
-			_, err := node.getConn(context.Background(), fmt.Sprintf("203.0.113.%d:9999", i+1))
+			_, _, err := node.meshPool.GetStream(context.Background(), fmt.Sprintf("203.0.113.%d:9999", i+1))
 			done <- err
 		}(i)
 	}
@@ -285,7 +285,7 @@ func TestDialHonoursCallerContext(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	if _, err := node.getConn(ctx, "203.0.113.9:9999"); err == nil {
+	if _, _, err := node.meshPool.GetStream(ctx, "203.0.113.9:9999"); err == nil {
 		t.Fatal("expected an error")
 	}
 	if elapsed := time.Since(start); elapsed > 3*time.Second {

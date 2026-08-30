@@ -46,6 +46,7 @@ func TestMemberlistAndQuicMesh(t *testing.T) {
 		QuicPort:  0,
 		Ring:      ring,
 		DBHandler: h,
+		PoolSize:  2,
 	}
 	node1, err := NewNode(cfg1)
 	if err != nil {
@@ -63,6 +64,7 @@ func TestMemberlistAndQuicMesh(t *testing.T) {
 		JoinAddrs: []string{node1.GossipAddr()},
 		Ring:      ring,
 		DBHandler: h,
+		PoolSize:  2,
 	}
 	node2, err := NewNode(cfg2)
 	if err != nil {
@@ -70,8 +72,26 @@ func TestMemberlistAndQuicMesh(t *testing.T) {
 	}
 	defer node2.Close()
 
-	// Wait brief moment for memberlist join sync
+	// Wait brief moment for memberlist join sync and proactive pool warmup
 	time.Sleep(500 * time.Millisecond)
+
+	// Verify memberlist understanding
+	if count := node1.MemberCount(); count != 2 {
+		t.Errorf("node1 member count = %d, want 2", count)
+	}
+	if count := node2.MemberCount(); count != 2 {
+		t.Errorf("node2 member count = %d, want 2", count)
+	}
+
+	members := node1.Members()
+	if len(members) != 2 {
+		t.Fatalf("node1 members len = %d, want 2", len(members))
+	}
+
+	// Verify sharding ring derived from memberlist
+	if ring.NodeCount() != 2 {
+		t.Errorf("ring node count = %d, want 2", ring.NodeCount())
+	}
 
 	// Execute QUIC Inter-Query from Node 2 to Node 1
 	target := node1.SelfQuicAddr()
@@ -95,4 +115,56 @@ func TestMemberlistAndQuicMesh(t *testing.T) {
 	if resp.Object == nil || string(resp.Object.Value) != `{"name":"Alice"}` {
 		t.Fatalf("unexpected object value: %+v", resp.Object)
 	}
+
+	// Verify mesh pool has pre-opened connections
+	if node2.MeshPool().PeerCount() != 1 {
+		t.Errorf("node2 peer count = %d, want 1", node2.MeshPool().PeerCount())
+	}
 }
+
+func TestMeshPoolLifecycleOnNodeDeparture(t *testing.T) {
+	ring := sharding.NewRing(1, 2)
+	node1, err := NewNode(NodeConfig{
+		NodeName: "leave-node-1",
+		BindAddr: "127.0.0.1",
+		BindPort: 0,
+		QuicPort: 0,
+		Ring:     ring,
+		PoolSize: 2,
+	})
+	if err != nil {
+		t.Fatalf("create node1: %v", err)
+	}
+	defer node1.Close()
+
+	node2, err := NewNode(NodeConfig{
+		NodeName:  "leave-node-2",
+		BindAddr:  "127.0.0.1",
+		BindPort:  0,
+		QuicPort:  0,
+		JoinAddrs: []string{node1.GossipAddr()},
+		Ring:      ring,
+		PoolSize:  2,
+	})
+	if err != nil {
+		t.Fatalf("create node2: %v", err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	if node1.MemberCount() != 2 {
+		t.Fatalf("expected 2 members, got %d", node1.MemberCount())
+	}
+
+	// Close node2
+	_ = node2.Close()
+
+	time.Sleep(500 * time.Millisecond)
+
+	// After node2 leaves, node1 should update sharding and clean up the peer pool
+	targetQuic := node2.SelfQuicAddr()
+	if ring.HasNode(targetQuic) {
+		t.Errorf("ring still has departed node %s", targetQuic)
+	}
+}
+
