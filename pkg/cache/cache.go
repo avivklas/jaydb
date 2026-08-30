@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"hash/fnv"
+	"runtime/trace"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -198,11 +199,13 @@ func objectSize(obj *storage.Object) int64 {
 
 // Get retrieves an object from cache or cold storage with singleflight coalescing.
 func (m *Manager) Get(ctx context.Context, key string) (*storage.Object, error) {
+	defer trace.StartRegion(ctx, "cache.get").End()
 	ttl := m.ttl
 	shard := m.shardFor(key)
 
 	// 1. Cache lookup under shard lock. A hit updates LastAccessed and moves
 	// the element to the front of the LRU list.
+	shardReg := trace.StartRegion(ctx, "cache.shard_lookup")
 	shard.mu.Lock()
 	if el, found := shard.items[key]; found {
 		item := el.Value.(*Item)
@@ -211,11 +214,13 @@ func (m *Manager) Get(ctx context.Context, key string) (*storage.Object, error) 
 			item.LastAccessed = time.Now()
 			shard.lru.MoveToFront(el)
 			shard.mu.Unlock()
+			shardReg.End()
 			atomic.AddUint64(&m.hits, 1)
 			return obj, nil
 		}
 	}
 	shard.mu.Unlock()
+	shardReg.End()
 
 	atomic.AddUint64(&m.misses, 1)
 
@@ -224,7 +229,10 @@ func (m *Manager) Get(ctx context.Context, key string) (*storage.Object, error) 
 	actual, loaded := m.sfCalls.LoadOrStore(key, call)
 	if loaded {
 		atomic.AddUint64(&m.sfHits, 1)
-		return awaitCall(ctx, actual.(*singleflightCall))
+		sfReg := trace.StartRegion(ctx, "cache.singleflight_wait")
+		val, err := awaitCall(ctx, actual.(*singleflightCall))
+		sfReg.End()
+		return val, err
 	}
 
 	defer func() {
@@ -232,10 +240,14 @@ func (m *Manager) Get(ctx context.Context, key string) (*storage.Object, error) 
 		close(call.done)
 	}()
 
+	coldReg := trace.StartRegion(ctx, "cache.cold_storage_get")
 	call.val, call.err = m.driver.Get(ctx, key)
+	coldReg.End()
 
 	if call.err == nil && call.val != nil {
+		admitReg := trace.StartRegion(ctx, "cache.admit")
 		m.admit(key, call.val)
+		admitReg.End()
 	} else if call.err != nil {
 		m.Invalidate(key)
 	}
@@ -345,6 +357,7 @@ func (m *Manager) EvictOldest() (freed int64, ok bool) {
 
 // Put writes an object to cold storage and populates the cache.
 func (m *Manager) Put(ctx context.Context, key string, value []byte, expectedETag string) (*storage.Object, error) {
+	defer trace.StartRegion(ctx, "cache.put").End()
 	obj, err := m.driver.Put(ctx, key, value, expectedETag)
 	if err != nil {
 		m.Invalidate(key)
@@ -357,6 +370,7 @@ func (m *Manager) Put(ctx context.Context, key string, value []byte, expectedETa
 
 // Delete removes an object from cold storage and invalidates the cache.
 func (m *Manager) Delete(ctx context.Context, key string, expectedETag string) error {
+	defer trace.StartRegion(ctx, "cache.delete").End()
 	err := m.driver.Delete(ctx, key, expectedETag)
 	m.Invalidate(key)
 	return err
