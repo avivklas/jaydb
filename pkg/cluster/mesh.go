@@ -162,7 +162,7 @@ type NodeConfig struct {
 
 const (
 	defaultDialTimeout       = 3 * time.Second
-	defaultStreamOpenTimeout = 500 * time.Millisecond
+	defaultStreamOpenTimeout = 100 * time.Millisecond
 	defaultRequestTimeout    = 10 * time.Second
 )
 
@@ -330,8 +330,9 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 
 	quicAddr := fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.QuicPort)
 	quicLn, err := quic.ListenAddr(quicAddr, serverTLSConf, &quic.Config{
-		MaxIdleTimeout:  30 * time.Second,
-		KeepAlivePeriod: 10 * time.Second,
+		MaxIncomingStreams: 2000,
+		MaxIdleTimeout:     30 * time.Second,
+		KeepAlivePeriod:    10 * time.Second,
 	})
 	if err != nil {
 		cancel()
@@ -456,7 +457,7 @@ func (n *Node) acceptLoop() {
 func (n *Node) handleConn(conn *quic.Conn) {
 	defer n.wg.Done() // Mark handleConn as finished
 	// Limit concurrent streams per connection to prevent goroutine explosion
-	const maxConcurrentStreams = 100
+	const maxConcurrentStreams = 1000
 	streamSem := make(chan struct{}, maxConcurrentStreams)
 
 	for {
