@@ -111,14 +111,9 @@ func (p *PeerPool) ensureSlotConnected(ctx context.Context, slot int) error {
 		return ErrPeerPoolClosed
 	}
 	conn := p.conns[slot]
-	if conn != nil {
-		select {
-		case <-conn.Context().Done():
-			// Stale connection, needs reconnect
-		default:
-			p.mu.RUnlock()
-			return nil // Still healthy
-		}
+	if conn != nil && conn.Context().Err() == nil {
+		p.mu.RUnlock()
+		return nil // Still healthy
 	}
 	p.mu.RUnlock()
 
@@ -132,13 +127,9 @@ func (p *PeerPool) ensureSlotConnected(ctx context.Context, slot int) error {
 		return ErrPeerPoolClosed
 	}
 	conn = p.conns[slot]
-	if conn != nil {
-		select {
-		case <-conn.Context().Done():
-		default:
-			p.mu.RUnlock()
-			return nil
-		}
+	if conn != nil && conn.Context().Err() == nil {
+		p.mu.RUnlock()
+		return nil
 	}
 	p.mu.RUnlock()
 
@@ -189,12 +180,10 @@ func (p *PeerPool) GetStream(ctx context.Context) (*quic.Stream, func(), error) 
 			continue
 		}
 
-		select {
-		case <-conn.Context().Done():
+		if conn.Context().Err() != nil {
 			// Stale connection, drop and trigger background reconnect
 			p.DropSlot(slot, conn)
 			continue
-		default:
 		}
 
 		openCtx, cancel := context.WithTimeout(ctx, p.cfg.StreamOpenTimeout)
@@ -203,24 +192,35 @@ func (p *PeerPool) GetStream(ctx context.Context) (*quic.Stream, func(), error) 
 
 		if err == nil {
 			dropFunc := func() {
-				p.DropSlot(slot, conn)
+				if conn.Context().Err() != nil {
+					p.DropSlot(slot, conn)
+				}
 			}
 			return stream, dropFunc, nil
 		}
 
-		// Stream open failed on this connection: drop it and try next slot
-		p.DropSlot(slot, conn)
+		// Only drop the connection if the socket itself died; transient stream open
+		// timeout or rate limit does NOT kill the underlying connection.
+		if conn.Context().Err() != nil {
+			p.DropSlot(slot, conn)
+		}
 	}
 
-	// If all pooled connections were dead or empty, attempt an on-demand reconnect for slot 0
-	if err := p.ensureSlotConnected(ctx, startIdx); err != nil {
-		return nil, nil, err
-	}
-
+	// If all pooled connections were dead or empty, attempt an on-demand reconnect for startIdx
 	p.mu.RLock()
 	conn := p.conns[startIdx]
 	p.mu.RUnlock()
-	if conn == nil {
+
+	if conn == nil || conn.Context().Err() != nil {
+		if err := p.ensureSlotConnected(ctx, startIdx); err != nil {
+			return nil, nil, err
+		}
+		p.mu.RLock()
+		conn = p.conns[startIdx]
+		p.mu.RUnlock()
+	}
+
+	if conn == nil || conn.Context().Err() != nil {
 		return nil, nil, ErrNoLiveConn
 	}
 
@@ -228,12 +228,16 @@ func (p *PeerPool) GetStream(ctx context.Context) (*quic.Stream, func(), error) 
 	stream, err := conn.OpenStreamSync(openCtx)
 	cancel()
 	if err != nil {
-		p.DropSlot(startIdx, conn)
+		if conn.Context().Err() != nil {
+			p.DropSlot(startIdx, conn)
+		}
 		return nil, nil, fmt.Errorf("quic open stream to %s: %w", p.cfg.TargetAddr, err)
 	}
 
 	dropFunc := func() {
-		p.DropSlot(startIdx, conn)
+		if conn.Context().Err() != nil {
+			p.DropSlot(startIdx, conn)
+		}
 	}
 	return stream, dropFunc, nil
 }
@@ -241,9 +245,11 @@ func (p *PeerPool) GetStream(ctx context.Context) (*quic.Stream, func(), error) 
 // DropSlot removes a connection from a slot if it matches the current entry and triggers background healing.
 func (p *PeerPool) DropSlot(slot int, conn *quic.Conn) {
 	p.mu.Lock()
-	if p.conns[slot] == conn {
-		p.conns[slot] = nil
+	if p.conns[slot] != conn {
+		p.mu.Unlock()
+		return
 	}
+	p.conns[slot] = nil
 	closed := p.closed
 	p.mu.Unlock()
 
@@ -252,7 +258,7 @@ func (p *PeerPool) DropSlot(slot int, conn *quic.Conn) {
 	}
 
 	if !closed {
-		// Asynchronously heal the dropped slot
+		// Asynchronously heal the dropped slot exactly once
 		go func() {
 			_ = p.ensureSlotConnected(p.ctx, slot)
 		}()
