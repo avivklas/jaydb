@@ -18,9 +18,9 @@ var (
 )
 
 const (
-	DefaultPoolSize          = 2
+	DefaultPoolSize          = 8
 	DefaultDialTimeout       = 3 * time.Second
-	DefaultStreamOpenTimeout = 500 * time.Millisecond
+	DefaultStreamOpenTimeout = 100 * time.Millisecond
 )
 
 // PeerPoolConfig specifies connection parameters for a single peer node.
@@ -336,8 +336,9 @@ func NewMeshPool(parentCtx context.Context, poolSize int, tlsConfig *tls.Config,
 		dialTo:    dialTo,
 		streamTo:  streamTo,
 		quicConfig: &quic.Config{
-			MaxIdleTimeout:  30 * time.Second,
-			KeepAlivePeriod: 10 * time.Second,
+			MaxIncomingStreams: 2000,
+			MaxIdleTimeout:     30 * time.Second,
+			KeepAlivePeriod:    10 * time.Second,
 		},
 		ctx:        ctx,
 		cancel:     cancel,
