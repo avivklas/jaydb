@@ -42,6 +42,11 @@ func newClusteredDB(t *testing.T) (*database, *reconcileCountingDriver, *shardin
 		BindPort: 0,
 		QuicPort: 0,
 		Ring:     ring,
+		// Peers added by these tests are deliberately dead addresses, so the
+		// only thing the production defaults buy here is a multi-second stall
+		// per attempted hop.
+		DialTimeout:       150 * time.Millisecond,
+		StreamOpenTimeout: 150 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("cluster node: %v", err)

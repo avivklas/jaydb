@@ -170,12 +170,38 @@ func (d *Driver) Put(ctx context.Context, key string, value []byte, expectedETag
 	out, err := d.client.PutObject(ctx, input)
 	if err != nil {
 		var apiErr smithy.APIError
-		if errors.As(err, &apiErr) && (apiErr.ErrorCode() == "PreconditionFailed" || apiErr.ErrorCode() == "412" || apiErr.ErrorCode() == "AccessDenied") {
-			if expectedETag == storage.MatchAnyETag {
-				return nil, storage.ErrAlreadyExists
+		if errors.As(err, &apiErr) {
+			switch apiErr.ErrorCode() {
+			case "PreconditionFailed", "412":
+				if expectedETag == storage.MatchAnyETag {
+					return nil, storage.ErrAlreadyExists
+				}
+				return nil, storage.ErrVersionMismatch
+
+			case "AccessDenied":
+				// Only If-None-Match may treat a 403 as "it already exists".
+				// S3 can answer AccessDenied rather than 412 there so that a
+				// caller without read access cannot use the precondition as an
+				// existence oracle, and for create-only the two outcomes are
+				// operationally the same: this caller did not create the object.
+				if expectedETag == storage.MatchAnyETag {
+					return nil, storage.ErrAlreadyExists
+				}
+
+				// For If-Match it is NOT the same, and conflating them hides a
+				// misconfiguration behind a plausible-looking conflict. A
+				// conditional overwrite requires BOTH s3:PutObject and
+				// s3:GetObject; missing the latter denies every attempt. Reported
+				// as ErrVersionMismatch that reaches the client as 412, so a
+				// permanent permissions failure is indistinguishable from a
+				// concurrent writer -- the caller re-reads, gets a validator that
+				// was never wrong, sends it back, and is denied again forever.
+				return nil, fmt.Errorf(
+					"s3 conditional put denied for %q: If-Match requires both s3:PutObject "+
+						"and s3:GetObject on this bucket: %w", s3Key, err)
 			}
-			return nil, storage.ErrVersionMismatch
 		}
+
 		return nil, fmt.Errorf("s3 put failed: %w", err)
 	}
 
