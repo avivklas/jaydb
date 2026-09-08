@@ -260,6 +260,11 @@ func (d *database) Get(ctx context.Context, key string, dest any) (*Meta, error)
 	defer trace.StartRegion(ctx, "db.get").End()
 	d.reconcileOwnership()
 
+	// nonOwner records that another node owns this key and the forwarded read
+	// did not answer, so the local read below must not populate the cache.
+	// See readLocal.
+	nonOwner := false
+
 	// Inter-query routing check
 	if d.opts.Ring != nil && d.opts.ClusterNode != nil {
 		targetNode := d.opts.Ring.GetNode(key)
@@ -292,20 +297,23 @@ func (d *database) Get(ctx context.Context, key string, dest any) (*Meta, error)
 			if err == nil && resp.Err != "" {
 				return nil, mapErrorString(resp.Err)
 			}
-			// Transport failure or incomplete response: fall through to local
-			// storage. The document lives in the same S3 bucket regardless of
-			// which node reads it; the cluster routing is a cache optimization,
-			// not a correctness requirement for reads. Degrading to a local
-			// read adds one S3 round-trip but avoids multi-second stalls from
-			// unhealthy mesh connections.
+			// Transport failure: fall through to a local read. The document
+			// lives in the same cold storage regardless of which node reads it,
+			// so routing is a cache optimization, not a correctness requirement
+			// for reads. Degrading here costs one cold-storage round-trip but
+			// avoids multi-second stalls from unhealthy mesh connections.
+			//
+			// The result is deliberately NOT cached: this node does not own the
+			// key, so nothing would ever invalidate the entry. See readLocal.
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
+			nonOwner = true
 			// Fall through to local read below.
 		}
 	}
 
-	obj, err := d.cacheMgr.Get(ctx, key)
+	obj, err := d.readLocal(ctx, key, nonOwner)
 	if err != nil {
 		return nil, err
 	}
@@ -324,6 +332,33 @@ func (d *database) Get(ctx context.Context, key string, dest any) (*Meta, error)
 		ETag:    obj.ETag,
 		ModTime: obj.ModTime,
 	}, nil
+}
+
+// readLocal reads a key from this node's own storage, going through the cache
+// ONLY when this node owns the key.
+//
+// Coherence in a cluster comes from ownership, not from the TTL: the owner's
+// cache is the only cache for a key, and it stays current because every write
+// for that key routes to that same node. An entry cached by a NON-owner is
+// therefore unreachable by invalidation -- the owner's Put updates the owner's
+// cache and nothing else -- so it would be served until the namespace TTL
+// expired or ring membership changed. With a generous namespace TTL that is
+// measured in hours.
+//
+// Serving a stale ETag is worse than serving a slow read. The client reads the
+// ETag, hands it straight back as If-Match, and every conditional write is
+// rejected with 412 while the validator it was given looks perfectly valid --
+// a failure that is indistinguishable, from the client's side, from a genuine
+// concurrent-write conflict.
+//
+// So a non-owner reads cold storage directly and remembers nothing.
+func (d *database) readLocal(ctx context.Context, key string, nonOwner bool) (*storage.Object, error) {
+	if nonOwner {
+		defer trace.StartRegion(ctx, "db.uncached_read").End()
+		return d.storageDrive.Get(ctx, key)
+	}
+
+	return d.cacheMgr.Get(ctx, key)
 }
 
 func (d *database) Put(ctx context.Context, key string, doc any, opts ...PutOption) (*Meta, error) {
